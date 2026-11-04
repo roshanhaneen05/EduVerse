@@ -29,6 +29,7 @@ import { RouterLink } from '@angular/router';
             <ul>
               <li><a routerLink="/login">Sign In to Portal</a></li>
               <li><a routerLink="/register">Register Student Account</a></li>
+              <li><a routerLink="/register" [queryParams]="{ role: 'instructor' }">Register as Instructor</a></li>
             </ul>
           </div>
 

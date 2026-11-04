@@ -14,7 +14,7 @@ from app.security.password import (
     verify_password,
 )
 from app.security.rate_limiter import check_rate_limit
-from app.services.auth_service import authenticate_user, register_student
+from app.services.auth_service import authenticate_user, register_user
 
 router = APIRouter(prefix="/auth", tags=["Authentication & Profile"])
 settings = get_settings()
@@ -24,10 +24,10 @@ settings = get_settings()
     "/register",
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Register a new student account",
+    summary="Register a new student or instructor account",
 )
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
-    user = register_student(db, user_in)
+    user = register_user(db, user_in)
     return user
 
 

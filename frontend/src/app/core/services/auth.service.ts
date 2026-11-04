@@ -39,7 +39,7 @@ export class AuthService {
     return localStorage.getItem(this.TOKEN_KEY);
   }
 
-  register(payload: { full_name: string; email: string; password: string }): Observable<User> {
+  register(payload: { full_name: string; email: string; password: string; role?: string }): Observable<User> {
     return this.http.post<User>(`${this.apiUrl}/register`, payload);
   }
 

@@ -197,6 +197,23 @@ export type PortalType = 'student' | 'instructor' | 'admin';
               </button>
             </div>
 
+            <!-- Demo Credentials Quick Helper Bar -->
+            <div class="demo-quick-bar">
+              <button type="button" class="demo-autofill-btn" (click)="fillDemoCredentials()">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                <span>Fill {{ selectedRole | titlecase }}</span>
+              </button>
+              <span class="demo-cred-hint">
+                @if (selectedRole === 'admin') {
+                  admin&#64;eduverse.io &bull; pass: <code>admin</code>
+                } @else if (selectedRole === 'instructor') {
+                  sarah.chen&#64;eduverse.io &bull; pass: <code>EduVerseDemo2026!</code>
+                } @else {
+                  alex.rivera&#64;eduverse.io &bull; pass: <code>EduVerseDemo2026!</code>
+                }
+              </span>
+            </div>
+
             <!-- Error or Info Alert -->
             @if (errorMessage) {
               <div class="card-message alert-danger">
@@ -320,7 +337,7 @@ export type PortalType = 'student' | 'instructor' | 'admin';
             </div>
 
             <!-- Create Account Button -->
-            <a routerLink="/register" class="create-account-pill-btn">
+            <a routerLink="/register" [queryParams]="{ role: selectedRole === 'instructor' ? 'instructor' : 'student' }" class="create-account-pill-btn">
               Create Account
             </a>
           </div>
@@ -660,6 +677,53 @@ export type PortalType = 'student' | 'instructor' | 'admin';
       box-shadow: 0 2px 8px rgba(79, 70, 229, 0.28);
     }
 
+    /* Demo Quick Bar */
+    .demo-quick-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
+      border-radius: 10px;
+      padding: 0.45rem 0.65rem;
+      margin-bottom: 1.15rem;
+      font-size: 0.775rem;
+    }
+    .demo-autofill-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      border: none;
+      background: #e0e7ff;
+      color: #4338ca;
+      font-size: 0.775rem;
+      font-weight: 700;
+      padding: 0.3rem 0.6rem;
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s ease;
+    }
+    .demo-autofill-btn:hover {
+      background: #4f46e5;
+      color: #ffffff;
+    }
+    .demo-cred-hint {
+      color: #64748b;
+      font-size: 0.74rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .demo-cred-hint code {
+      background: #e2e8f0;
+      padding: 1px 4px;
+      border-radius: 4px;
+      font-weight: 600;
+      color: #334155;
+    }
+
     /* Alerts */
     .card-message {
       display: flex;
@@ -936,6 +1000,26 @@ export class LoginComponent implements OnInit {
     this.selectedRole = role;
     this.errorMessage = '';
     this.infoNotice = '';
+  }
+
+  fillDemoCredentials(): void {
+    if (this.selectedRole === 'admin') {
+      this.loginForm.patchValue({
+        email: 'admin@eduverse.io',
+        password: 'admin'
+      });
+    } else if (this.selectedRole === 'instructor') {
+      this.loginForm.patchValue({
+        email: 'sarah.chen@eduverse.io',
+        password: 'EduVerseDemo2026!'
+      });
+    } else {
+      this.loginForm.patchValue({
+        email: 'alex.rivera@eduverse.io',
+        password: 'EduVerseDemo2026!'
+      });
+    }
+    this.errorMessage = '';
   }
 
   isFieldInvalid(field: string): boolean {

@@ -1,8 +1,10 @@
-import { Component } from '@angular/core';
+import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, FormGroup, Validators, AbstractControl, ValidationErrors } from '@angular/forms';
-import { Router, RouterLink } from '@angular/router';
+import { Router, ActivatedRoute, RouterLink } from '@angular/router';
 import { AuthService } from '../../core/services/auth.service';
+
+export type RegisterRole = 'student' | 'instructor';
 
 function passwordMatchValidator(control: AbstractControl): ValidationErrors | null {
   const password = control.get('password');
@@ -39,8 +41,55 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
             </svg>
           </div>
           <span class="auth-brand-name">EduVerse</span>
-          <h2>Create Your Account</h2>
-          <p class="auth-subtitle">Join thousands of students and start your learning journey today</p>
+          <h2>
+            @if (selectedRole === 'instructor') {
+              Register as Instructor
+            } @else {
+              Create Student Account
+            }
+          </h2>
+          <p class="auth-subtitle">
+            @if (selectedRole === 'instructor') {
+              Share your expertise, publish courses, and inspire learners worldwide
+            } @else {
+              Join thousands of students and start your learning journey today
+            }
+          </p>
+        </div>
+
+        <!-- Role Selector Tabs -->
+        <div class="card-role-track" role="tablist">
+          <button
+            type="button"
+            class="role-pill-btn"
+            [class.active]="selectedRole === 'student'"
+            (click)="selectRole('student')"
+            role="tab"
+            [attr.aria-selected]="selectedRole === 'student'"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 10v6M2 10l10-5 10 5-10 5z"/>
+              <path d="M6 12v5c3 3 9 3 12 0v-5"/>
+            </svg>
+            <span>Student</span>
+          </button>
+
+          <button
+            type="button"
+            class="role-pill-btn"
+            [class.active]="selectedRole === 'instructor'"
+            (click)="selectRole('instructor')"
+            role="tab"
+            [attr.aria-selected]="selectedRole === 'instructor'"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <line x1="19" y1="8" x2="19" y2="14"/>
+              <line x1="22" y1="11" x2="16" y2="11"/>
+            </svg>
+            <span>Instructor</span>
+          </button>
         </div>
 
         @if (errorMessage) {
@@ -56,13 +105,15 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
 
         <form [formGroup]="registerForm" (ngSubmit)="onSubmit()" class="auth-form">
           <div class="form-group">
-            <label class="form-label" for="full_name">Full Name</label>
+            <label class="form-label" for="full_name">
+              {{ selectedRole === 'instructor' ? 'Instructor Full Name' : 'Full Name' }}
+            </label>
             <input
               id="full_name"
               type="text"
               class="form-input"
               formControlName="full_name"
-              placeholder="e.g. Jordan Taylor"
+              [placeholder]="selectedRole === 'instructor' ? 'e.g. Dr. Sarah Chen' : 'e.g. Jordan Taylor'"
               [class.input-error]="isFieldInvalid('full_name')"
             />
             @if (isFieldInvalid('full_name')) {
@@ -77,7 +128,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
               type="email"
               class="form-input"
               formControlName="email"
-              placeholder="e.g. student@eduverse.io"
+              [placeholder]="selectedRole === 'instructor' ? 'e.g. instructor@eduverse.io' : 'e.g. student@eduverse.io'"
               [class.input-error]="isFieldInvalid('email')"
             />
             @if (isFieldInvalid('email')) {
@@ -120,9 +171,9 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
           <button type="submit" class="btn btn-primary btn-block" [disabled]="registerForm.invalid || isLoading">
             @if (isLoading) {
               <div class="spinner-sm"></div>
-              <span>Creating Account...</span>
+              <span>Creating {{ selectedRole === 'instructor' ? 'Instructor' : 'Student' }} Account...</span>
             } @else {
-              <span>Create Account</span>
+              <span>Register as {{ selectedRole === 'instructor' ? 'Instructor' : 'Student' }}</span>
               <span class="arrow-circle">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M5 12h14"/>
@@ -137,7 +188,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
           <span class="divider-caption">Already have an account?</span>
         </div>
 
-        <a routerLink="/login" class="signin-pill-btn">
+        <a routerLink="/login" [queryParams]="{ role: selectedRole }" class="signin-pill-btn">
           Sign In
         </a>
       </div>
@@ -217,6 +268,44 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
       font-size: 0.925rem;
       line-height: 1.5;
     }
+
+    /* Role Tabs */
+    .card-role-track {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 4px;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 6px;
+      margin-bottom: 1.5rem;
+    }
+    .role-pill-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.45rem;
+      padding: 0.6rem 0.5rem;
+      border-radius: 8px;
+      border: none;
+      background: transparent;
+      color: #475569;
+      font-size: 0.875rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .role-pill-btn:hover:not(.active) {
+      color: #0f172a;
+      background-color: #f1f5f9;
+    }
+    .role-pill-btn.active {
+      background: #4f46e5;
+      color: #ffffff;
+      font-weight: 600;
+      box-shadow: 0 2px 8px rgba(79, 70, 229, 0.28);
+    }
+
     .btn-block {
       width: 100%;
       margin-top: 1.25rem;
@@ -297,15 +386,17 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
     @keyframes spin { to { transform: rotate(360deg); } }
   `]
 })
-export class RegisterComponent {
+export class RegisterComponent implements OnInit {
   registerForm: FormGroup;
+  selectedRole: RegisterRole = 'student';
   isLoading = false;
   errorMessage = '';
 
   constructor(
     private fb: FormBuilder,
     private auth: AuthService,
-    private router: Router
+    private router: Router,
+    private route: ActivatedRoute
   ) {
     this.registerForm = this.fb.group({
       full_name: ['', [Validators.required, Validators.minLength(2), Validators.maxLength(100)]],
@@ -313,6 +404,18 @@ export class RegisterComponent {
       password: ['', [Validators.required, Validators.minLength(8)]],
       confirm_password: ['', [Validators.required]]
     }, { validators: passwordMatchValidator });
+  }
+
+  ngOnInit(): void {
+    const roleParam = this.route.snapshot.queryParams['role'];
+    if (roleParam === 'instructor' || roleParam === 'student') {
+      this.selectedRole = roleParam;
+    }
+  }
+
+  selectRole(role: RegisterRole): void {
+    this.selectedRole = role;
+    this.errorMessage = '';
   }
 
   isFieldInvalid(field: string): boolean {
@@ -328,17 +431,27 @@ export class RegisterComponent {
 
     const { full_name, email, password } = this.registerForm.value;
 
-    this.auth.register({ full_name, email, password }).subscribe({
+    this.auth.register({
+      full_name: full_name.trim(),
+      email: email.trim(),
+      password,
+      role: this.selectedRole
+    }).subscribe({
       next: () => {
         // Automatically login the newly created user
-        this.auth.login({ email, password }).subscribe({
-          next: () => {
+        this.auth.login({ email: email.trim(), password }).subscribe({
+          next: (res) => {
             this.isLoading = false;
-            this.router.navigate(['/student/dashboard']);
+            const targetRole = res.user?.role || this.selectedRole;
+            if (targetRole === 'instructor') {
+              this.router.navigate(['/instructor/dashboard']);
+            } else {
+              this.router.navigate(['/student/dashboard']);
+            }
           },
           error: () => {
             this.isLoading = false;
-            this.router.navigate(['/login']);
+            this.router.navigate(['/login'], { queryParams: { role: this.selectedRole } });
           }
         });
       },
