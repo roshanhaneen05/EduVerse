@@ -102,6 +102,7 @@ def get_course_detail(
 
     is_enrolled = False
     completion_percentage = 0.0
+    enrollment_status = None
     completed_lesson_ids = set()
 
     if current_user:
@@ -114,8 +115,10 @@ def get_course_detail(
             .first()
         )
         if enrollment:
-            is_enrolled = True
-            completion_percentage = enrollment.completion_percentage
+            enrollment_status = enrollment.status
+            is_enrolled = enrollment.status == "approved"
+            if is_enrolled:
+                completion_percentage = enrollment.completion_percentage
 
             progress_records = (
                 db.query(LessonProgress.lesson_id)
@@ -124,15 +127,20 @@ def get_course_detail(
                     LessonProgress.is_completed == True,
                 )
                 .all()
-            )
+            ) if is_enrolled else []
             completed_lesson_ids = {r[0] for r in progress_records}
 
+    restrict_course_content = bool(
+        current_user
+        and current_user.role == "student"
+        and enrollment_status != "approved"
+    )
     lessons = (
         db.query(Lesson)
         .filter(Lesson.course_id == course_id)
         .order_by(Lesson.order_index.asc())
         .all()
-    )
+    ) if not restrict_course_content else []
     lesson_items = [
         LessonOutlineItem(
             id=l.id,
@@ -151,7 +159,7 @@ def get_course_detail(
         .filter(CourseSection.course_id == course_id)
         .order_by(CourseSection.order_index.asc())
         .all()
-    )
+    ) if not restrict_course_content else []
     section_items = []
     for s in sections:
         sec_lessons = [item for item in lesson_items if item.section_id == s.id]
@@ -171,7 +179,7 @@ def get_course_detail(
     quiz_query = db.query(Quiz).filter(Quiz.course_id == course_id)
     if not is_manager:
         quiz_query = quiz_query.filter(Quiz.is_published == True)
-    quizzes = quiz_query.order_by(Quiz.id.asc()).all()
+    quizzes = [] if restrict_course_content else quiz_query.order_by(Quiz.id.asc()).all()
 
     quiz_items = [
         QuizOutlineItem(
@@ -198,7 +206,9 @@ def get_course_detail(
     if not current_user or (current_user.role != "admin" and course.instructor_id != current_user.id):
         assignment_query = assignment_query.filter(Assignment.is_published == True)
 
-    assignments = assignment_query.order_by(Assignment.created_at.asc()).all()
+    assignments = (
+        [] if restrict_course_content else assignment_query.order_by(Assignment.created_at.asc()).all()
+    )
 
     user_submissions = {}
     if current_user and assignments:
@@ -272,6 +282,7 @@ def get_course_detail(
         assignments=assignment_items,
         materials=material_items,
         is_enrolled=is_enrolled,
+        enrollment_status=enrollment_status,
         completion_percentage=completion_percentage,
     )
 

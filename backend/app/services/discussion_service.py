@@ -40,6 +40,7 @@ def check_course_access(db: Session, course_id: int, user: User) -> Course:
         .filter(
             CourseEnrollment.course_id == course_id,
             CourseEnrollment.student_id == user.id,
+            CourseEnrollment.status == "approved",
         )
         .first()
     )
@@ -463,4 +464,3 @@ def delete_reply(
 
     reply.is_deleted = True
     db.commit()
-

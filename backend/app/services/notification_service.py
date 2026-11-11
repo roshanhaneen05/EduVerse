@@ -39,10 +39,13 @@ def notify_enrolled_students(
     link_url: Optional[str] = None,
     exclude_user_id: Optional[int] = None,
 ) -> int:
-    """Send a notification to all active enrolled students in a course, excluding the sender."""
+    """Notify approved students in a course, excluding the sender."""
     enrollments = (
         db.query(CourseEnrollment)
-        .filter(CourseEnrollment.course_id == course_id)
+        .filter(
+            CourseEnrollment.course_id == course_id,
+            CourseEnrollment.status == "approved",
+        )
         .all()
     )
 
@@ -143,4 +146,3 @@ def mark_all_notifications_as_read(
     if count > 0:
         db.commit()
     return count
-

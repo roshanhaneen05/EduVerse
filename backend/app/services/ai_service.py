@@ -52,6 +52,7 @@ def check_course_access(db: Session, course_id: int, user: User) -> Course:
         .filter(
             CourseEnrollment.course_id == course_id,
             CourseEnrollment.student_id == user.id,
+            CourseEnrollment.status == "approved",
         )
         .first()
     )
@@ -566,7 +567,10 @@ def get_student_study_recommendations(
     enrollments = (
         db.query(CourseEnrollment)
         .options(joinedload(CourseEnrollment.course))
-        .filter(CourseEnrollment.student_id == student_id)
+        .filter(
+            CourseEnrollment.student_id == student_id,
+            CourseEnrollment.status == "approved",
+        )
         .all()
     )
 

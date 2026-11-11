@@ -175,6 +175,70 @@ import { InstructorEnrollment } from '../../core/models/enrollment.model';
 
           <div class="section-block">
             <div class="section-header">
+              <div>
+                <h2>Enrollment Requests</h2>
+                <p class="subtitle">Review students requesting access to your courses.</p>
+              </div>
+              <span class="badge badge-warning">{{ enrollmentRequests.length }} Pending</span>
+            </div>
+            @if (decisionMessage) {
+              <div class="alert alert-success">{{ decisionMessage }}</div>
+            }
+            @if (decisionError) {
+              <div class="alert alert-danger">{{ decisionError }}</div>
+            }
+            @if (enrollmentRequests.length === 0) {
+              <div class="empty-block card">
+                <h3>No pending enrollment requests</h3>
+                <p>New student requests for your courses will appear here.</p>
+              </div>
+            } @else {
+              <div class="table-container card">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Student Name</th>
+                      <th>Student Email</th>
+                      <th>Course Name</th>
+                      <th>Enrollment Date</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (request of enrollmentRequests; track request.enrollment_id) {
+                      <tr>
+                        <td><strong>{{ request.student_name }}</strong></td>
+                        <td>{{ request.student_email }}</td>
+                        <td>{{ request.course_name }}</td>
+                        <td>{{ request.enrolled_at | date:'medium' }}</td>
+                        <td><span class="badge badge-warning">Pending</span></td>
+                        <td>
+                          <div class="action-buttons">
+                            <button
+                              (click)="reviewEnrollment(request, 'approve')"
+                              class="btn btn-sm btn-primary"
+                              [disabled]="processingEnrollmentId === request.enrollment_id">
+                              {{ processingEnrollmentId === request.enrollment_id ? 'Processing...' : 'Approve' }}
+                            </button>
+                            <button
+                              (click)="reviewEnrollment(request, 'reject')"
+                              class="btn btn-sm btn-danger"
+                              [disabled]="processingEnrollmentId === request.enrollment_id">
+                              Reject
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+          </div>
+
+          <div class="section-block">
+            <div class="section-header">
               <h2>Student Enrollments</h2>
               <span class="badge badge-neutral">{{ enrollments.length }} Students</span>
             </div>
@@ -204,8 +268,8 @@ import { InstructorEnrollment } from '../../core/models/enrollment.model';
                         <td>{{ enr.course_name }}</td>
                         <td>{{ enr.enrolled_at | date:'short' }}</td>
                         <td>
-                          <span class="badge" [ngClass]="enr.status === 'completed' ? 'badge-success' : 'badge-primary'">
-                            {{ enr.status === 'completed' ? 'Completed' : 'Active' }}
+                          <span class="badge" [ngClass]="enr.status === 'approved' ? 'badge-success' : enr.status === 'pending' ? 'badge-warning' : 'badge-danger'">
+                            {{ enr.status | titlecase }}
                           </span>
                         </td>
                       </tr>
@@ -403,8 +467,12 @@ export class InstructorDashboardComponent implements OnInit {
   stats: EnhancedInstructorDashboardStats | null = null;
   myCourses: Course[] = [];
   enrollments: InstructorEnrollment[] = [];
+  enrollmentRequests: InstructorEnrollment[] = [];
   isLoading = true;
   errorMessage = '';
+  decisionMessage = '';
+  decisionError = '';
+  processingEnrollmentId: number | null = null;
 
   constructor(private instructorService: InstructorService) {}
 
@@ -425,7 +493,16 @@ export class InstructorDashboardComponent implements OnInit {
             this.instructorService.getStudentEnrollments().subscribe({
               next: (enrollments) => {
                 this.enrollments = enrollments;
-                this.isLoading = false;
+                this.instructorService.getEnrollmentRequests().subscribe({
+                  next: (requests) => {
+                    this.enrollmentRequests = requests;
+                    this.isLoading = false;
+                  },
+                  error: (err) => {
+                    this.isLoading = false;
+                    this.errorMessage = err.error?.detail || 'Failed to load enrollment requests.';
+                  }
+                });
               },
               error: (err) => {
                 this.isLoading = false;
@@ -442,6 +519,46 @@ export class InstructorDashboardComponent implements OnInit {
       error: (err) => {
         this.isLoading = false;
         this.errorMessage = err.error?.detail || 'Failed to load faculty metrics.';
+      }
+    });
+  }
+
+  reviewEnrollment(request: InstructorEnrollment, decision: 'approve' | 'reject'): void {
+    const action = decision === 'approve' ? 'approve' : 'reject';
+    const confirmMessage = decision === 'approve'
+      ? `Approve ${request.student_name} for "${request.course_name}"? The student will gain course access.`
+      : `Reject ${request.student_name}'s request for "${request.course_name}"?`;
+    if (!window.confirm(confirmMessage)) return;
+
+    this.processingEnrollmentId = request.enrollment_id;
+    this.decisionMessage = '';
+    this.decisionError = '';
+    const request$ = decision === 'approve'
+      ? this.instructorService.approveEnrollment(request.enrollment_id)
+      : this.instructorService.rejectEnrollment(request.enrollment_id);
+
+    request$.subscribe({
+      next: (result) => {
+        this.processingEnrollmentId = null;
+        this.enrollmentRequests = this.enrollmentRequests.filter(
+          (item) => item.enrollment_id !== result.enrollment_id
+        );
+        const enrollment = this.enrollments.find(
+          (item) => item.enrollment_id === result.enrollment_id
+        );
+        if (enrollment) {
+          enrollment.status = result.status;
+          enrollment.reviewed_at = new Date().toISOString();
+        }
+
+        const decisionText = result.status === 'approved' ? 'approved' : 'rejected';
+        this.decisionMessage = result.email_notification_status === 'sent'
+          ? `Request ${decisionText}. The email server accepted a notification for the student.`
+          : `Request ${decisionText}. Student email notification is ${result.email_notification_status.replace('_', ' ')}; an administrator can retry it.`;
+      },
+      error: (err) => {
+        this.processingEnrollmentId = null;
+        this.decisionError = err.error?.detail || `Could not ${action} this enrollment request.`;
       }
     });
   }

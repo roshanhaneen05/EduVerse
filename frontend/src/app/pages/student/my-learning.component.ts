@@ -101,6 +101,11 @@ import { EnrolledCourseDetail } from '../../core/models/student.model';
                     @if (c.status === 'completed') {
                       <span class="badge badge-success">✓ 100% Completed</span>
                     }
+                    @if (c.enrollment_status === 'pending') {
+                      <span class="badge badge-warning">Pending approval</span>
+                    } @else if (c.enrollment_status === 'rejected') {
+                      <span class="badge badge-danger">Rejected</span>
+                    }
                   </div>
 
                   <h3 class="course-title">
@@ -111,6 +116,7 @@ import { EnrolledCourseDetail } from '../../core/models/student.model';
                   </p>
                 </div>
 
+                @if (c.enrollment_status === 'approved') {
                 <div class="progress-section">
                   <div class="progress-labels">
                     <span class="lesson-count-sub">
@@ -134,14 +140,21 @@ import { EnrolledCourseDetail } from '../../core/models/student.model';
                     </p>
                   }
                 </div>
+                } @else if (c.enrollment_status === 'pending') {
+                  <p class="enrollment-status-note">Your enrollment request is waiting for instructor approval.</p>
+                } @else {
+                  <p class="enrollment-status-note">Your enrollment request was rejected by the instructor.</p>
+                }
 
                 <div class="card-footer">
                   <div class="date-info">
                     <span>Enrolled {{ c.enrolled_at | date:'mediumDate' }}</span>
                   </div>
-                  <button (click)="continueCourse(c)" class="btn btn-sm btn-primary">
-                    {{ c.status === 'completed' ? 'Review Course' : 'Continue Learning' }} →
-                  </button>
+                  @if (c.enrollment_status === 'approved') {
+                    <button (click)="continueCourse(c)" class="btn btn-sm btn-primary">
+                      {{ c.status === 'completed' ? 'Review Course' : 'Continue Learning' }} →
+                    </button>
+                  }
                 </div>
               </div>
             }
@@ -445,4 +458,3 @@ export class MyLearningComponent implements OnInit {
     }
   }
 }
-

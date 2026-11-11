@@ -114,6 +114,7 @@ def get_quiz_for_student(db: Session, quiz_id: int, user: User) -> QuizResponse:
             .filter(
                 CourseEnrollment.student_id == user.id,
                 CourseEnrollment.course_id == quiz.course_id,
+                CourseEnrollment.status == "approved",
             )
             .first()
         )
@@ -197,6 +198,7 @@ def start_quiz_attempt(db: Session, quiz_id: int, user: User) -> QuizStartRespon
         enrollment = db.query(CourseEnrollment).filter(
             CourseEnrollment.student_id == user.id,
             CourseEnrollment.course_id == quiz.course_id,
+            CourseEnrollment.status == "approved",
         ).first()
         if not enrollment:
             raise HTTPException(
@@ -301,6 +303,7 @@ def evaluate_quiz_submission(
         enrollment = db.query(CourseEnrollment).filter(
             CourseEnrollment.student_id == user.id,
             CourseEnrollment.course_id == quiz.course_id,
+            CourseEnrollment.status == "approved",
         ).first()
         if not enrollment:
             raise HTTPException(

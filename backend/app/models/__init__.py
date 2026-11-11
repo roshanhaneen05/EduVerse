@@ -16,6 +16,7 @@ from app.models.material import LearningMaterial
 from app.models.announcement import CourseAnnouncement
 from app.models.discussion import CourseDiscussion, DiscussionReply
 from app.models.notification import Notification
+from app.models.email_delivery import EmailDelivery
 
 __all__ = [
     "User",
@@ -39,4 +40,5 @@ __all__ = [
     "CourseDiscussion",
     "DiscussionReply",
     "Notification",
+    "EmailDelivery",
 ]

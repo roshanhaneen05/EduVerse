@@ -6,12 +6,14 @@ export interface Enrollment {
   course_id: number;
   enrolled_at: string;
   completion_percentage: number;
-  status: 'active' | 'completed';
+  status: 'pending' | 'approved' | 'rejected';
   student_name: string;
   student_email: string;
   course_name: string;
   instructor_id: number;
   email_notification_status?: 'sent' | 'failed' | 'not_configured' | null;
+  reviewed_at?: string | null;
+  reviewed_by_instructor_id?: number | null;
   course?: Course;
 }
 
@@ -24,5 +26,12 @@ export interface InstructorEnrollment {
   course_name: string;
   instructor_id: number;
   enrolled_at: string;
-  status: 'active' | 'completed';
+  status: 'pending' | 'approved' | 'rejected';
+  reviewed_at?: string | null;
+}
+
+export interface EnrollmentDecision {
+  enrollment_id: number;
+  status: 'approved' | 'rejected';
+  email_notification_status: 'sent' | 'failed' | 'not_configured';
 }

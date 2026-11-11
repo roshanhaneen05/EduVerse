@@ -44,6 +44,8 @@ def get_my_enrollments(
                     student_email=current_user.email,
                     course_name=enr.course.title,
                     instructor_id=enr.course.instructor_id,
+                    reviewed_at=enr.reviewed_at,
+                    reviewed_by_instructor_id=enr.reviewed_by_instructor_id,
                     course=enriched,
                 )
             )

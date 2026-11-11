@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.dependencies import get_db, require_admin
 from app.models.assignment import Assignment, AssignmentSubmission
 from app.models.course import Course
+from app.models.email_delivery import EmailDelivery
 from app.models.enrollment import CourseEnrollment
 from app.models.lesson import Lesson
 from app.models.material import LearningMaterial
@@ -36,9 +37,14 @@ from app.schemas.admin_analytics import (
 )
 from app.schemas.common import MessageResponse
 from app.schemas.course import CourseResponse
+from app.schemas.enrollment import EmailDeliveryResponse
 from app.schemas.user import UserAdminUpdate, UserResponse
 from app.services.course_service import enrich_course_response
-from app.services.email_service import EmailNotConfiguredError, send_test_email
+from app.services.email_service import (
+    EmailNotConfiguredError,
+    send_email_delivery,
+    send_test_email,
+)
 from app.services.admin_analytics_service import (
     analytics_csv_report,
     analytics_pdf_report,
@@ -91,6 +97,56 @@ def test_email_configuration(
         ) from exc
 
     return MessageResponse(message="SMTP accepted the test email for delivery.")
+
+
+@router.post(
+    "/email/deliveries/{delivery_id}/retry",
+    response_model=MessageResponse,
+    summary="Retry a failed enrollment email notification",
+)
+def retry_email_delivery(
+    delivery_id: int,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    delivery = db.query(EmailDelivery).filter(EmailDelivery.id == delivery_id).first()
+    if not delivery:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email delivery not found.")
+    if delivery.status not in ("failed", "pending"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only pending or failed email notifications can be retried.",
+        )
+
+    result = send_email_delivery(db, delivery, settings)
+    if result == "sent":
+        return MessageResponse(message="Email server accepted the notification for delivery.")
+    if result == "not_configured":
+        return MessageResponse(message="Email remains queued; configure SMTP credentials before retrying.")
+    return MessageResponse(message="Email delivery failed and can be retried after resolving the SMTP issue.")
+
+
+@router.get(
+    "/email/deliveries",
+    response_model=List[EmailDeliveryResponse],
+    summary="List pending or failed enrollment email notifications",
+)
+def list_email_deliveries(
+    delivery_status: str = Query("failed", alias="status"),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if delivery_status not in ("pending", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Delivery status must be pending or failed.",
+        )
+    return (
+        db.query(EmailDelivery)
+        .filter(EmailDelivery.status == delivery_status)
+        .order_by(EmailDelivery.updated_at.asc())
+        .all()
+    )
 
 
 @router.get(

@@ -42,6 +42,7 @@ def check_student_course_access(db: Session, course_id: int, user: User) -> Cour
             .filter(
                 CourseEnrollment.student_id == user.id,
                 CourseEnrollment.course_id == course_id,
+                CourseEnrollment.status == "approved",
             )
             .first()
         )

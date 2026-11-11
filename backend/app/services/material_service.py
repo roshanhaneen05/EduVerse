@@ -40,6 +40,7 @@ def check_course_material_access(db: Session, course_id: int, user: User) -> Cou
             .filter(
                 CourseEnrollment.student_id == user.id,
                 CourseEnrollment.course_id == course_id,
+                CourseEnrollment.status == "approved",
             )
             .first()
         )
@@ -272,4 +273,3 @@ def get_material_file_for_download(db: Session, material_id: int, current_user: 
 
     # If stream or bytes (e.g. cloud)
     return mat, storage.get_file_bytes(mat.storage_key)
-

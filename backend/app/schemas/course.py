@@ -108,4 +108,5 @@ class CourseDetailResponse(CourseResponse):
     materials: List[MaterialOutlineItem] = []
     sections: List[Any] = []
     is_enrolled: bool = False
+    enrollment_status: Optional[str] = None
     completion_percentage: float = 0.0

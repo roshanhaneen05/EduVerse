@@ -6,7 +6,7 @@ The EduVerse backend is a modular monolith built with **Python 3.13**, **FastAPI
 
 ## 1. Database Architecture & Storage
 
-- **Database Engine**: SQLite 3 for local development; fully portable to PostgreSQL for production.
+- **Database Engine**: SQLite 3 by default for local development; MySQL is supported with `mysql+pymysql://...` in `DATABASE_URL`, and PostgreSQL remains supported.
 - **Persistent Storage Location**: `C:\EduVerse\backend\data\eduverse.db` (configured via `DATABASE_URL` in `.env`).
 - **Foreign Key Enforcement**: SQLite does not enable foreign keys by default. EduVerse automatically activates `PRAGMA foreign_keys=ON;` on every database connection via an engine connection listener in [database.py](file:///C:/EduVerse/backend/app/database.py).
 - **Session Lifecycle**: Database sessions are provided per request via FastAPI dependency injection (`get_db`) and closed in `finally` blocks.

@@ -100,6 +100,7 @@ export interface CourseDetail extends Course {
   materials?: LearningMaterial[];
   enrollment_count: number;
   user_progress_percentage?: number;
+  enrollment_status?: 'pending' | 'approved' | 'rejected' | null;
 }
 
 export interface CourseCreatePayload {
@@ -117,4 +118,3 @@ export interface CourseUpdatePayload {
   difficulty?: string;
   is_published?: boolean;
 }
-

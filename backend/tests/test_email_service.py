@@ -13,7 +13,9 @@ from app.routers import admin as admin_router
 from app.services.email_service import (
     EmailNotConfiguredError,
     InvalidEmailAddressError,
+    build_approval_email,
     build_enrollment_email,
+    build_rejection_email,
     send_enrollment_email,
 )
 
@@ -42,7 +44,7 @@ def test_enrollment_email_contains_required_details():
         student_id=1,
         course_id=1,
         enrolled_at=datetime(2026, 3, 19, tzinfo=timezone.utc),
-        status="active",
+        status="pending",
     )
     settings = Settings(
         EMAIL_HOST="smtp.gmail.com",
@@ -56,12 +58,66 @@ def test_enrollment_email_contains_required_details():
     message = build_enrollment_email(enrollment, student, course, instructor, settings)
 
     assert message["To"] == instructor.email
-    assert message["Subject"] == "New Student Enrollment - Example Course"
-    body = message.get_content()
+    assert message["Subject"] == "New Course Enrollment Request - EduVerse"
+    plain_body, html_part = message.get_payload()
+    body = plain_body.get_content()
     assert student.full_name in body
     assert student.email in body
     assert course.title in body
-    assert "Enrollment Date:" in body
+    assert "Enrollment date:" in body
+    html_body = html_part.get_content()
+    assert "EduVerse" in html_body
+    assert student.full_name in html_body
+    assert student.email in html_body
+    assert course.title in html_body
+    assert "Request status" in html_body
+    assert "Pending" in body
+
+
+def test_enrollment_email_escapes_untrusted_html_content():
+    student = SimpleNamespace(full_name="<Student>", email="student@example.com")
+    instructor = SimpleNamespace(full_name="<Instructor>", email="instructor@example.com")
+    course = SimpleNamespace(title="<Course>")
+    enrollment = SimpleNamespace(enrolled_at=datetime(2026, 3, 19, tzinfo=timezone.utc))
+    settings = Settings(
+        EMAIL_HOST_USER="mailer@example.com",
+        EMAIL_HOST_PASSWORD="app-password",
+        DEFAULT_FROM_EMAIL="mailer@example.com",
+    )
+
+    message = build_enrollment_email(enrollment, student, course, instructor, settings)
+    html_body = message.get_payload()[1].get_content()
+
+    assert "&lt;Student&gt;" in html_body
+    assert "&lt;Instructor&gt;" in html_body
+    assert "&lt;Course&gt;" in html_body
+    assert "<Student>" not in html_body
+
+
+@pytest.mark.parametrize(
+    ("builder", "subject", "required_text"),
+    [
+        (build_approval_email, "Your Enrollment Has Been Approved - EduVerse", "can now sign in"),
+        (build_rejection_email, "Your Course Enrollment Request - EduVerse", "not approved"),
+    ],
+)
+def test_student_decision_emails_use_the_registered_student_email(builder, subject, required_text):
+    student = SimpleNamespace(full_name="Student", email="student@example.com")
+    instructor = SimpleNamespace(full_name="Instructor", email="instructor@example.com")
+    course = SimpleNamespace(title="Example Course")
+    enrollment = SimpleNamespace(enrolled_at=datetime(2026, 3, 19, tzinfo=timezone.utc))
+    settings = Settings(
+        EMAIL_HOST_USER="mailer@example.com",
+        EMAIL_HOST_PASSWORD="app-password",
+        DEFAULT_FROM_EMAIL="mailer@example.com",
+    )
+
+    message = builder(enrollment, student, course, instructor, settings)
+
+    assert message["To"] == student.email
+    assert message["Subject"] == subject
+    assert required_text in message.get_payload()[0].get_content()
+    assert course.title in message.get_payload()[1].get_content()
 
 
 def test_enrollment_email_requires_smtp_configuration():
@@ -71,7 +127,7 @@ def test_enrollment_email_requires_smtp_configuration():
                 student_id=1,
                 course_id=1,
                 enrolled_at=datetime.now(timezone.utc),
-                status="active",
+                status="pending",
             ),
             SimpleNamespace(full_name="Student", email="student@example.com"),
             SimpleNamespace(title="Course"),
@@ -87,7 +143,7 @@ def test_enrollment_email_rejects_invalid_instructor_email():
                 student_id=1,
                 course_id=1,
                 enrolled_at=datetime.now(timezone.utc),
-                status="active",
+                status="pending",
             ),
             SimpleNamespace(full_name="Student", email="student@example.com"),
             SimpleNamespace(title="Course"),

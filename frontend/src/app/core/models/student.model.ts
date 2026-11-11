@@ -46,7 +46,7 @@ export interface EnrolledCourseDetail {
   enrolled_at: string;
   completion_percentage: number;
   status: 'in_progress' | 'completed';
-  enrollment_status: 'active' | 'completed';
+  enrollment_status: 'pending' | 'approved' | 'rejected';
   total_lessons: number;
   completed_lessons: number;
   remaining_lessons: number;

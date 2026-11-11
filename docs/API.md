@@ -84,23 +84,29 @@
 | `POST` | `/instructor/courses/{id}/quizzes` | Create quiz with questions and answers | Course Owner / Admin |
 | `DELETE` | `/instructor/quizzes/{id}` | Delete quiz | Course Owner / Admin |
 
-### Enrollment email notifications
+### Student enrollment requests and instructor approval
 
-Successful student enrollment is committed before the backend attempts an instructor notification. The response includes `email_notification_status` (`sent`, `failed`, or `not_configured`); an SMTP failure does not undo the enrollment. Notification delivery uses the assigned instructor's address from the database.
+`POST /api/v1/courses/{course_id}/enroll` creates a `pending` request and commits it before attempting the instructor notification. Duplicate requests return `409`. Students can inspect the status through `/api/v1/enrollments/my-courses` and `/api/v1/student/my-learning`. Pending and rejected requests do not grant access to lessons, quizzes, assignments, materials, announcements, or AI course features.
+
+The assigned course instructor sees pending requests at `GET /api/v1/instructor/enrollment-requests` and reviews them with `POST /api/v1/instructor/enrollments/{enrollment_id}/approve` or `/reject`. Only the instructor assigned to the course can decide. Decisions record the reviewer and timestamp and are final; enrollment rows are retained. The instructor dashboard removes reviewed requests immediately.
+
+Each notification is recorded in the `email_deliveries` outbox in the same transaction as the enrollment or review decision, then sent after commit. `email_notification_status` is `sent`, `failed`, or `not_configured`; a mail problem never rolls back the enrollment/decision. Administrators can find pending or failed notifications at `GET /api/v1/admin/email/deliveries?status=failed` (or `status=pending`) and retry one at `POST /api/v1/admin/email/deliveries/{delivery_id}/retry`. The outbox allows one notification per enrollment event and blocks concurrent or repeated retries after SMTP has accepted a message.
+
+Configure these values in `backend/.env` (see `backend/.env.example`): `EMAIL_HOST=smtp.gmail.com`, `EMAIL_PORT=587`, `EMAIL_USE_TLS=True`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL`. Enable 2-Step Verification on the sending Google account and create a Google App Password; use that App Password for `EMAIL_HOST_PASSWORD`, not your normal account password. Set `DEFAULT_FROM_EMAIL` to the sending address. SMTP credentials remain backend-only, and the repository ignores `.env`. The legacy `SMTP_*` environment names are accepted for compatibility. Restart the backend after editing `.env`.
 
 Configure these values in `backend/.env` (see `backend/.env.example`): `EMAIL_HOST=smtp.gmail.com`, `EMAIL_PORT=587`, `EMAIL_USE_TLS=true`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL`. Enable 2-Step Verification on the sending Google account and create an App Password; use that App Password for `EMAIL_HOST_PASSWORD`, not your normal account password. Set `DEFAULT_FROM_EMAIL` to the sending address. SMTP credentials remain backend-only. The legacy `SMTP_*` environment names are accepted for compatibility. Restart the backend after editing `.env`.
 
-To check connectivity and send a notification, start the backend, authenticate as a student, and `POST /api/v1/courses/{course_id}/enroll` for a published course that does not already have an enrollment for that student. A successful response reports `email_notification_status: "sent"` only after Gmail accepts the message; `failed` and `not_configured` are logged and enrollment remains saved. A second request for the same student/course returns `409` and does not send another email.
+To test the full flow, authenticate as a student and request a published course. The assigned instructor gets the pending request email and can approve or reject it in the instructor dashboard; the student receives a decision notification. A successful SMTP call means Gmail accepted the message for processing, not that final delivery to an inbox is guaranteed. If SMTP is unavailable, the pending enrollment/decision remains saved and its notification can be retried by an administrator after fixing configuration. A second request for the same student/course returns `409` and does not create another request email.
 
 An administrator can test SMTP without enrolling a student by posting `{"recipient_email":"you@example.com"}` to `/api/v1/admin/email/test` with the admin bearer token. This endpoint exists only when `ENVIRONMENT=development`; it reports success only after SMTP accepts the message and never returns credentials.
 
-The enrollment status migration and any remaining migrations can be applied from `backend` with:
+Apply the enrollment approval/outbox migration and any remaining migrations from `backend` with:
 
 ```powershell
 python -m alembic upgrade head
 ```
 
-If the backend virtual environment is activated, `alembic upgrade head` is equivalent. Existing enrollments are retained; rows with 100% completion are marked `completed`, and the rest are marked `active`.
+If the backend virtual environment is activated, `alembic upgrade head` is equivalent. Existing enrollment rows are retained and migrated to `approved`, preserving access; course completion remains in `completion_percentage`.
 
 ---
 

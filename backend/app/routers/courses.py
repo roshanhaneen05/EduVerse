@@ -1,6 +1,4 @@
 from datetime import datetime, timezone
-import logging
-import smtplib
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
@@ -8,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.dependencies import get_current_user, get_db
 from app.models.course import Course
+from app.models.email_delivery import EmailDelivery
 from app.models.enrollment import CourseEnrollment
 from app.models.lesson import Lesson
 from app.models.section import CourseSection
@@ -18,7 +17,10 @@ from app.schemas.enrollment import EnrollmentResponse
 from app.schemas.section import SectionDetailResponse
 from app.security.rbac import get_token_from_request, require_student
 from app.config import get_settings
-from app.services.email_service import EmailNotConfiguredError, send_enrollment_email
+from app.services.email_service import (
+    ENROLLMENT_REQUEST,
+    send_email_delivery,
+)
 from app.services.course_service import (
     enrich_course_response,
     get_course_detail,
@@ -26,7 +28,6 @@ from app.services.course_service import (
 )
 
 router = APIRouter(prefix="/courses", tags=["Courses & Catalog"])
-logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -132,9 +133,16 @@ def enroll_in_course(
         course_id=course_id,
         enrolled_at=datetime.now(timezone.utc),
         completion_percentage=0.0,
-        status="active",
+        status="pending",
     )
     db.add(enrollment)
+    db.flush()
+    delivery = EmailDelivery(
+        enrollment_id=enrollment.id,
+        event_type=ENROLLMENT_REQUEST,
+        recipient_email=instructor.email,
+    )
+    db.add(delivery)
     try:
         db.commit()
     except IntegrityError as exc:
@@ -150,23 +158,8 @@ def enroll_in_course(
             ) from exc
         raise
     db.refresh(enrollment)
-
-    email_notification_status = "sent"
-    try:
-        send_enrollment_email(enrollment, current_user, course, instructor, settings)
-    except EmailNotConfiguredError as exc:
-        email_notification_status = "not_configured"
-        logger.warning(
-            "Enrollment %s saved, but instructor email is not configured: %s",
-            enrollment.id,
-            exc,
-        )
-    except (smtplib.SMTPException, OSError, ValueError):
-        email_notification_status = "failed"
-        logger.exception(
-            "Enrollment %s was saved, but instructor email delivery failed",
-            enrollment.id,
-        )
+    db.refresh(delivery)
+    email_notification_status = send_email_delivery(db, delivery, settings)
 
     enriched_course = enrich_course_response(db, course)
     return EnrollmentResponse(
@@ -181,6 +174,9 @@ def enroll_in_course(
         course_name=course.title,
         instructor_id=instructor.id,
         email_notification_status=email_notification_status,
+        email_delivery_id=delivery.id,
+        reviewed_at=enrollment.reviewed_at,
+        reviewed_by_instructor_id=enrollment.reviewed_by_instructor_id,
         course=enriched_course,
     )
 

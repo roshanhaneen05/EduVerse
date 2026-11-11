@@ -13,7 +13,7 @@ import {
 import { LessonCreatePayload, Lesson, LessonUpdatePayload } from '../models/lesson.model';
 import { Quiz, QuizCreatePayload, QuizUpdatePayload } from '../models/quiz.model';
 import { Assignment, AssignmentCreatePayload, AssignmentSubmission, AssignmentUpdatePayload, SubmissionGradePayload } from '../models/assignment.model';
-import { InstructorEnrollment } from '../models/enrollment.model';
+import { EnrollmentDecision, InstructorEnrollment } from '../models/enrollment.model';
 
 @Injectable({
   providedIn: 'root'
@@ -29,6 +29,24 @@ export class InstructorService {
 
   getStudentEnrollments(): Observable<InstructorEnrollment[]> {
     return this.http.get<InstructorEnrollment[]>(`${this.apiUrl}/enrollments`);
+  }
+
+  getEnrollmentRequests(): Observable<InstructorEnrollment[]> {
+    return this.http.get<InstructorEnrollment[]>(`${this.apiUrl}/enrollment-requests`);
+  }
+
+  approveEnrollment(enrollmentId: number): Observable<EnrollmentDecision> {
+    return this.http.post<EnrollmentDecision>(
+      `${this.apiUrl}/enrollments/${enrollmentId}/approve`,
+      {}
+    );
+  }
+
+  rejectEnrollment(enrollmentId: number): Observable<EnrollmentDecision> {
+    return this.http.post<EnrollmentDecision>(
+      `${this.apiUrl}/enrollments/${enrollmentId}/reject`,
+      {}
+    );
   }
 
   getCourseAnalytics(courseId: number): Observable<CourseAnalyticsResponse> {

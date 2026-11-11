@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from sqlalchemy import func
@@ -8,6 +9,7 @@ from app.models.assignment import Assignment, AssignmentSubmission
 from app.models.course import Course
 from app.models.section import CourseSection
 from app.models.enrollment import CourseEnrollment
+from app.models.email_delivery import EmailDelivery
 from app.models.lesson import Lesson
 from app.services.file_validator import validate_upload_content
 from app.services.storage import get_storage_provider
@@ -18,7 +20,10 @@ from app.models.quiz import (
 )
 from app.models.user import User
 from app.schemas.admin import InstructorDashboardStats
-from app.schemas.enrollment import InstructorEnrollmentResponse
+from app.schemas.enrollment import (
+    EnrollmentDecisionResponse,
+    InstructorEnrollmentResponse,
+)
 from app.schemas.analytics import (
     CourseAnalyticsResponse,
     CourseStudentReportResponse,
@@ -83,8 +88,15 @@ from app.services.course_service import (
     list_courses,
     update_course,
 )
+from app.services.email_service import (
+    ENROLLMENT_APPROVED,
+    ENROLLMENT_REJECTED,
+    send_email_delivery,
+)
+from app.config import get_settings
 
 router = APIRouter(prefix="/instructor", tags=["Instructor Management"])
+settings = get_settings()
 
 
 def check_course_ownership(course: Course, user: User):
@@ -140,9 +152,151 @@ def get_instructor_enrollments(
             instructor_id=enrollment.course.instructor_id,
             enrolled_at=enrollment.enrolled_at,
             status=enrollment.status,
+            reviewed_at=enrollment.reviewed_at,
         )
         for enrollment in enrollments
     ]
+
+
+@router.get(
+    "/enrollment-requests",
+    response_model=List[InstructorEnrollmentResponse],
+    summary="List pending enrollment requests for the authenticated instructor",
+)
+def get_enrollment_requests(
+    current_user: User = Depends(require_instructor),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "instructor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned instructor can review enrollment requests.",
+        )
+
+    requests = (
+        db.query(CourseEnrollment)
+        .join(Course, Course.id == CourseEnrollment.course_id)
+        .options(
+            joinedload(CourseEnrollment.student),
+            joinedload(CourseEnrollment.course),
+        )
+        .filter(
+            Course.instructor_id == current_user.id,
+            CourseEnrollment.status == "pending",
+        )
+        .order_by(CourseEnrollment.enrolled_at.asc())
+        .all()
+    )
+    return [
+        InstructorEnrollmentResponse(
+            enrollment_id=enrollment.id,
+            student_id=enrollment.student_id,
+            student_name=enrollment.student.full_name,
+            student_email=enrollment.student.email,
+            course_id=enrollment.course_id,
+            course_name=enrollment.course.title,
+            instructor_id=current_user.id,
+            enrolled_at=enrollment.enrolled_at,
+            status=enrollment.status,
+            reviewed_at=enrollment.reviewed_at,
+        )
+        for enrollment in requests
+    ]
+
+
+def _review_enrollment(
+    enrollment_id: int,
+    decision: str,
+    event_type: str,
+    current_user: User,
+    db: Session,
+) -> EnrollmentDecisionResponse:
+    if current_user.role != "instructor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned instructor can review enrollment requests.",
+        )
+
+    enrollment = (
+        db.query(CourseEnrollment)
+        .options(
+            joinedload(CourseEnrollment.course),
+            joinedload(CourseEnrollment.student),
+        )
+        .filter(CourseEnrollment.id == enrollment_id)
+        .with_for_update()
+        .first()
+    )
+    if not enrollment or not enrollment.course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enrollment request not found.")
+    if enrollment.course.instructor_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You may only review requests for your assigned courses.",
+        )
+    if enrollment.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This enrollment request has already been reviewed.",
+        )
+
+    enrollment.status = decision
+    enrollment.reviewed_at = datetime.now(timezone.utc)
+    enrollment.reviewed_by_instructor_id = current_user.id
+    delivery = EmailDelivery(
+        enrollment_id=enrollment.id,
+        event_type=event_type,
+        recipient_email=enrollment.student.email,
+    )
+    db.add(delivery)
+    db.commit()
+    db.refresh(delivery)
+
+    email_status = send_email_delivery(db, delivery, settings)
+    return EnrollmentDecisionResponse(
+        enrollment_id=enrollment.id,
+        status=enrollment.status,
+        email_notification_status=email_status,
+        email_delivery_id=delivery.id,
+    )
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/approve",
+    response_model=EnrollmentDecisionResponse,
+    summary="Approve a pending enrollment request",
+)
+def approve_enrollment(
+    enrollment_id: int,
+    current_user: User = Depends(require_instructor),
+    db: Session = Depends(get_db),
+):
+    return _review_enrollment(
+        enrollment_id,
+        "approved",
+        ENROLLMENT_APPROVED,
+        current_user,
+        db,
+    )
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/reject",
+    response_model=EnrollmentDecisionResponse,
+    summary="Reject a pending enrollment request",
+)
+def reject_enrollment(
+    enrollment_id: int,
+    current_user: User = Depends(require_instructor),
+    db: Session = Depends(get_db),
+):
+    return _review_enrollment(
+        enrollment_id,
+        "rejected",
+        ENROLLMENT_REJECTED,
+        current_user,
+        db,
+    )
 
 
 @router.get(
@@ -310,7 +464,10 @@ def get_course_students(
     enrollments = (
         db.query(CourseEnrollment)
         .options(joinedload(CourseEnrollment.student))
-        .filter(CourseEnrollment.course_id == course_id)
+        .filter(
+            CourseEnrollment.course_id == course_id,
+            CourseEnrollment.status == "approved",
+        )
         .all()
     )
 
@@ -1057,4 +1214,3 @@ def grade_student_submission(
     db: Session = Depends(get_db),
 ):
     return service_grade_submission(db, submission_id, grade_in, current_user)
-

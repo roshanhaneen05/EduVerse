@@ -133,16 +133,31 @@ import { AuthService } from '../../core/services/auth.service';
                     <div class="rec-top">
                       <div class="badge-row">
                         <span class="badge badge-primary">{{ course.course_category }}</span>
-                        <span class="badge" [ngClass]="course.enrollment_status === 'completed' ? 'badge-success' : 'badge-warning'">
-                          {{ course.enrollment_status === 'completed' ? 'Completed' : 'Active' }}
-                        </span>
+                        @if (course.enrollment_status === 'pending') {
+                          <span class="badge badge-warning">Pending</span>
+                        } @else if (course.enrollment_status === 'rejected') {
+                          <span class="badge badge-danger">Rejected</span>
+                        } @else if (course.status === 'completed') {
+                          <span class="badge badge-success">Completed</span>
+                        } @else {
+                          <span class="badge badge-success">Approved</span>
+                        }
                       </div>
                       <h3>{{ course.course_title }}</h3>
-                      <p class="rec-desc">{{ course.completion_percentage }}% course progress</p>
+                      @if (course.enrollment_status === 'pending') {
+                        <p class="rec-desc enrollment-status-note">Your enrollment request is waiting for instructor approval.</p>
+                      } @else if (course.enrollment_status === 'rejected') {
+                        <p class="rec-desc enrollment-status-note">Your enrollment request was rejected by the instructor.</p>
+                      } @else {
+                        <p class="rec-desc">Your enrollment has been approved. You can now access this course.</p>
+                        <p class="rec-desc">{{ course.completion_percentage }}% course progress</p>
+                      }
                     </div>
                     <div class="rec-footer">
                       <span class="inst-name">Enrolled {{ course.enrolled_at | date:'mediumDate' }}</span>
-                      <a [routerLink]="['/courses', course.course_id]" class="btn btn-sm btn-outline">Open Course</a>
+                      @if (course.enrollment_status === 'approved') {
+                        <a [routerLink]="['/courses', course.course_id]" class="btn btn-sm btn-outline">Open Course</a>
+                      }
                     </div>
                   </div>
                 }

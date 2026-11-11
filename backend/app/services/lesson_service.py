@@ -48,6 +48,7 @@ def get_lesson_for_user(db: Session, lesson_id: int, user: User) -> LessonRespon
             .filter(
                 CourseEnrollment.student_id == user.id,
                 CourseEnrollment.course_id == lesson.course_id,
+                CourseEnrollment.status == "approved",
             )
             .first()
         )
@@ -95,7 +96,10 @@ def mark_lesson_complete(db: Session, lesson_id: int, user: User) -> LessonProgr
         )
         .first()
     )
-    if not enrollment and user.role not in ("instructor", "admin"):
+    if (
+        user.role not in ("instructor", "admin")
+        and (not enrollment or enrollment.status != "approved")
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You must be enrolled in the course to record progress.",
@@ -144,7 +148,6 @@ def mark_lesson_complete(db: Session, lesson_id: int, user: User) -> LessonProgr
 
     if enrollment:
         enrollment.completion_percentage = completion_percentage
-        enrollment.status = "completed" if completion_percentage >= 100.0 else "active"
         db.commit()
 
     return LessonProgressResponse(

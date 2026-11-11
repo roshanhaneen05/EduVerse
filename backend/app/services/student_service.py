@@ -50,6 +50,7 @@ def get_continue_learning_lesson(
         .filter(
             CourseEnrollment.student_id == student_id,
             CourseEnrollment.course_id == course_id,
+            CourseEnrollment.status == "approved",
         )
         .first()
     )
@@ -252,7 +253,10 @@ def list_student_assignments(
     """
     enrolled_courses = (
         db.query(CourseEnrollment.course_id)
-        .filter(CourseEnrollment.student_id == student_id)
+        .filter(
+            CourseEnrollment.student_id == student_id,
+            CourseEnrollment.status == "approved",
+        )
         .all()
     )
     enrolled_ids = [e[0] for e in enrolled_courses]
@@ -460,13 +464,14 @@ def get_student_dashboard_data(
     - Real course recommendations
     """
     enrolled_courses = list_student_enrolled_courses(db, student_id)
+    approved_courses = [course for course in enrolled_courses if course.enrollment_status == "approved"]
     total_enrolled = len(enrolled_courses)
-    completed_courses = sum(1 for e in enrolled_courses if e.completion_percentage >= 100.0)
-    in_progress_courses = total_enrolled - completed_courses
+    completed_courses = sum(1 for e in approved_courses if e.completion_percentage >= 100.0)
+    in_progress_courses = len(approved_courses) - completed_courses
 
     overall_progress = (
-        round(sum(e.completion_percentage for e in enrolled_courses) / total_enrolled, 1)
-        if total_enrolled > 0
+        round(sum(e.completion_percentage for e in approved_courses) / len(approved_courses), 1)
+        if approved_courses
         else 0.0
     )
 

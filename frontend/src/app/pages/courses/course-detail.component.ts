@@ -76,7 +76,11 @@ import { AuthService } from '../../core/services/auth.service';
               <div class="action-card-header">
                 <h3>Course Status</h3>
                 @if (course.is_enrolled) {
-                  <span class="badge badge-success">Enrolled</span>
+                  <span class="badge badge-success">Approved</span>
+                } @else if (course.enrollment_status === 'pending') {
+                  <span class="badge badge-warning">Pending approval</span>
+                } @else if (course.enrollment_status === 'rejected') {
+                  <span class="badge badge-danger">Request rejected</span>
                 }
               </div>
 
@@ -86,7 +90,11 @@ import { AuthService } from '../../core/services/auth.service';
                 </div>
               }
 
-              @if (course.is_enrolled) {
+              @if (course.enrollment_status === 'pending') {
+                <p class="enroll-perk">Your enrollment request is waiting for instructor approval. Course lessons will be available after approval.</p>
+              } @else if (course.enrollment_status === 'rejected') {
+                <p class="enroll-perk">Your enrollment request was rejected by the instructor. Contact the instructor if you have questions.</p>
+              } @else if (course.is_enrolled) {
                 <div class="progress-box">
                   <div class="progress-header">
                     <span>Your Learning Progress</span>
@@ -838,14 +846,20 @@ export class CourseDetailComponent implements OnInit {
       next: (enrollment) => {
         this.isEnrolling = false;
         this.enrollMessage = enrollment.email_notification_status === 'sent'
-          ? 'Successfully enrolled! Your instructor has been notified. You may now begin your lessons.'
+          ? 'Your enrollment request was submitted. The email server accepted a notification for your instructor. Your course access will begin after approval.'
           : enrollment.email_notification_status === 'not_configured'
-            ? 'Successfully enrolled! Your instructor email notification is not configured yet.'
+            ? 'Your enrollment request was submitted and is waiting for approval. Instructor email is not configured yet; the notification is available for administrator retry.'
             : enrollment.email_notification_status === 'failed'
-              ? 'Successfully enrolled, but the instructor email could not be sent. Please contact support.'
-              : 'Successfully enrolled! You may now begin your lessons.';
-        this.course!.is_enrolled = true;
+              ? 'Your enrollment request was submitted and is waiting for approval, but the instructor email could not be sent. An administrator can retry it.'
+              : 'Your enrollment request was submitted and is waiting for instructor approval.';
+        this.course!.enrollment_status = 'pending';
+        this.course!.is_enrolled = false;
         this.course!.user_progress_percentage = 0;
+        this.course!.lessons = [];
+        this.course!.sections = [];
+        this.course!.quizzes = [];
+        this.course!.assignments = [];
+        this.course!.materials = [];
       },
       error: (err) => {
         this.isEnrolling = false;

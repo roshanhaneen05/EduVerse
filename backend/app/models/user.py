@@ -41,7 +41,12 @@ class User(Base):
 
     # Relationships
     courses = relationship("Course", back_populates="instructor", cascade="all, delete-orphan")
-    enrollments = relationship("CourseEnrollment", back_populates="student", cascade="all, delete-orphan")
+    enrollments = relationship(
+        "CourseEnrollment",
+        back_populates="student",
+        foreign_keys="CourseEnrollment.student_id",
+        cascade="all, delete-orphan",
+    )
     lesson_progress = relationship("LessonProgress", back_populates="student", cascade="all, delete-orphan")
     quiz_attempts = relationship("QuizAttempt", back_populates="student")
     assignment_submissions = relationship(

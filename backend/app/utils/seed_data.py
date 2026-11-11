@@ -351,6 +351,9 @@ def seed_database():
                     course_id=course1.id,
                     enrolled_at=datetime.now(timezone.utc),
                     completion_percentage=50.0,
+                    status="approved",
+                    reviewed_at=datetime.now(timezone.utc),
+                    reviewed_by_instructor_id=course1.instructor_id,
                 )
                 db.add(enr)
                 db.flush()
