@@ -51,6 +51,7 @@ class EnrolledCourseDetail(BaseModel):
     enrolled_at: datetime
     completion_percentage: float
     status: str  # "in_progress" or "completed"
+    enrollment_status: str
     total_lessons: int
     completed_lessons: int
     remaining_lessons: int
@@ -123,4 +124,3 @@ class EnhancedStudentDashboardResponse(BaseModel):
     recent_grades: List[StudentRecentGrade] = []
     recommended_courses: List[CourseResponse] = []
     enrolled_courses: List[EnrolledCourseDetail] = []
-

@@ -13,6 +13,7 @@ import {
 import { LessonCreatePayload, Lesson, LessonUpdatePayload } from '../models/lesson.model';
 import { Quiz, QuizCreatePayload, QuizUpdatePayload } from '../models/quiz.model';
 import { Assignment, AssignmentCreatePayload, AssignmentSubmission, AssignmentUpdatePayload, SubmissionGradePayload } from '../models/assignment.model';
+import { InstructorEnrollment } from '../models/enrollment.model';
 
 @Injectable({
   providedIn: 'root'
@@ -24,6 +25,10 @@ export class InstructorService {
 
   getDashboard(): Observable<EnhancedInstructorDashboardStats> {
     return this.http.get<EnhancedInstructorDashboardStats>(`${this.apiUrl}/dashboard`);
+  }
+
+  getStudentEnrollments(): Observable<InstructorEnrollment[]> {
+    return this.http.get<InstructorEnrollment[]>(`${this.apiUrl}/enrollments`);
   }
 
   getCourseAnalytics(courseId: number): Observable<CourseAnalyticsResponse> {

@@ -66,7 +66,7 @@ def login(login_data: UserLogin, request: Request, response: Response, db: Sessi
         key="auth_token",
         value=access_token,
         httponly=True,
-        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60 if login_data.remember_me else None,
         samesite="lax",
         secure=settings.is_production,
     )
@@ -143,4 +143,3 @@ def change_password(
     current_user.password_hash = hash_password(pwd_data.new_password)
     db.commit()
     return MessageResponse(message="Password successfully updated.")
-

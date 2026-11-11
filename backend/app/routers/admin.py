@@ -1,10 +1,15 @@
+import logging
 import math
-from datetime import datetime
+import smtplib
+from datetime import date, datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.dependencies import get_db, require_admin
 from app.models.assignment import Assignment, AssignmentSubmission
 from app.models.course import Course
@@ -20,12 +25,72 @@ from app.schemas.admin import (
     PaginatedUserResponse,
     PlatformStats,
 )
+from app.schemas.admin_analytics import (
+    AdminAnalyticsActivity,
+    AdminAnalyticsDashboard,
+    AdminAnalyticsOverview,
+    AdminAnalyticsTrends,
+    AdminCourseAnalytics,
+    AdminInstructorAnalytics,
+    AdminStudentAnalytics,
+)
 from app.schemas.common import MessageResponse
 from app.schemas.course import CourseResponse
 from app.schemas.user import UserAdminUpdate, UserResponse
 from app.services.course_service import enrich_course_response
+from app.services.email_service import EmailNotConfiguredError, send_test_email
+from app.services.admin_analytics_service import (
+    analytics_csv_report,
+    analytics_pdf_report,
+    build_admin_analytics,
+)
 
 router = APIRouter(prefix="/admin", tags=["Administrator Management"])
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+class EmailTestRequest(BaseModel):
+    recipient_email: EmailStr
+
+
+@router.post(
+    "/email/test",
+    response_model=MessageResponse,
+    summary="Send a development SMTP test message",
+)
+def test_email_configuration(
+    request: EmailTestRequest,
+    current_user: User = Depends(require_admin),
+):
+    if settings.ENVIRONMENT.lower() != "development":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This endpoint is available only in development.",
+        )
+
+    try:
+        send_test_email(str(request.recipient_email), settings)
+    except EmailNotConfiguredError as exc:
+        logger.error("SMTP test email is not configured: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.exception("SMTP test email authentication failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="SMTP authentication failed. Verify EMAIL_HOST_USER and the Google App Password.",
+        ) from exc
+    except (smtplib.SMTPException, OSError, ValueError) as exc:
+        logger.exception("SMTP test email delivery failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"SMTP test email failed: {exc}",
+        ) from exc
+
+    return MessageResponse(message="SMTP accepted the test email for delivery.")
 
 
 @router.get(
@@ -428,4 +493,138 @@ def admin_toggle_publish(
         assignment_count=assignments,
         created_at=course.created_at,
         updated_at=course.updated_at,
+    )
+
+
+def _admin_analytics(
+    db: Session, start_date: Optional[date], end_date: Optional[date]
+) -> AdminAnalyticsDashboard:
+    try:
+        return build_admin_analytics(db, start_date, end_date)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+
+@router.get(
+    "/analytics/dashboard",
+    response_model=AdminAnalyticsDashboard,
+    summary="Get all administrator analytics for the selected date range",
+)
+def get_admin_analytics_dashboard(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date)
+
+
+@router.get(
+    "/analytics/overview",
+    response_model=AdminAnalyticsOverview,
+    summary="Get administrator overview statistics",
+)
+def get_admin_analytics_overview(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date).overview
+
+
+@router.get(
+    "/analytics/students",
+    response_model=AdminStudentAnalytics,
+    summary="Get student analytics and performance rankings",
+)
+def get_admin_student_analytics(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date).students
+
+
+@router.get(
+    "/analytics/courses",
+    response_model=AdminCourseAnalytics,
+    summary="Get course analytics and course rankings",
+)
+def get_admin_course_analytics(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date).courses
+
+
+@router.get(
+    "/analytics/instructors",
+    response_model=AdminInstructorAnalytics,
+    summary="Get instructor analytics and enrollment totals",
+)
+def get_admin_instructor_analytics(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date).instructors
+
+
+@router.get(
+    "/analytics/trends",
+    response_model=AdminAnalyticsTrends,
+    summary="Get monthly registration, enrollment, and student activity trends",
+)
+def get_admin_analytics_trends(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date).trends
+
+
+@router.get(
+    "/analytics/activities",
+    response_model=List[AdminAnalyticsActivity],
+    summary="Get recent administrative activity",
+)
+def get_admin_analytics_activities(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _admin_analytics(db, start_date, end_date).recent_activities
+
+
+@router.get(
+    "/analytics/export",
+    summary="Export administrative analytics as CSV or PDF",
+)
+def export_admin_analytics(
+    report_format: str = Query("csv", alias="format", pattern="^(csv|pdf)$"),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    data = _admin_analytics(db, start_date, end_date)
+    if report_format == "csv":
+        return Response(
+            content=analytics_csv_report(data),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="eduverse-analytics.csv"'},
+        )
+    return Response(
+        content=analytics_pdf_report(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="eduverse-analytics.pdf"'},
     )

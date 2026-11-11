@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, text
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -16,9 +16,11 @@ class CourseEnrollment(Base):
         nullable=False,
     )
     completion_percentage = Column(Float, default=0.0, nullable=False)
+    status = Column(String(30), default="active", server_default=text("'active'"), nullable=False)
 
     __table_args__ = (
         UniqueConstraint("student_id", "course_id", name="uq_student_course_enrollment"),
+        CheckConstraint("status IN ('active', 'completed')", name="ck_enrollment_status_valid"),
         CheckConstraint(
             "completion_percentage >= 0.0 AND completion_percentage <= 100.0",
             name="ck_enrollment_completion_percentage",

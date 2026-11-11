@@ -1,15 +1,13 @@
-import { Component, OnInit } from '@angular/core';
+import { Component } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { ReactiveFormsModule, FormBuilder, FormGroup, Validators } from '@angular/forms';
-import { Router, ActivatedRoute, RouterLink } from '@angular/router';
+import { ReactiveFormsModule, FormsModule, FormBuilder, FormGroup, Validators } from '@angular/forms';
+import { Router, RouterLink } from '@angular/router';
 import { AuthService } from '../../core/services/auth.service';
-
-export type PortalType = 'student' | 'instructor' | 'admin';
 
 @Component({
   selector: 'app-login',
   standalone: true,
-  imports: [CommonModule, ReactiveFormsModule, RouterLink],
+  imports: [CommonModule, FormsModule, ReactiveFormsModule, RouterLink],
   template: `
     <div class="light-login-page">
       <!-- Ambient Decorative Curved Waves in Background -->
@@ -24,7 +22,7 @@ export type PortalType = 'student' | 'instructor' | 'admin';
 
       <!-- Top Navigation Header -->
       <header class="top-nav-header">
-        <div class="header-brand">
+        <a class="header-brand" routerLink="/" aria-label="EduVerse home">
           <div class="brand-cap-wrap">
             <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
               <path d="M16 4L2 11L16 18L30 11L16 4Z" fill="#4f46e5"/>
@@ -33,12 +31,11 @@ export type PortalType = 'student' | 'instructor' | 'admin';
             </svg>
           </div>
           <span class="header-brand-name">EduVerse</span>
-        </div>
+        </a>
 
         <nav class="header-nav-links">
-          <a routerLink="/courses" class="nav-item">Courses</a>
-          <a class="nav-item" (click)="onNavClick('about')">About</a>
-          <a class="nav-item" (click)="onNavClick('support')">Support</a>
+        <a routerLink="/" class="nav-item">Home</a>
+        <a routerLink="/register" class="nav-item">Create an account</a>
         </nav>
       </header>
 
@@ -56,19 +53,11 @@ export type PortalType = 'student' | 'instructor' | 'admin';
           </div>
 
           <!-- Main Hero Headline -->
-          <h1 class="main-hero-heading">
-            A Smarter Way to<br/>
-            <span class="gradient-accent-text">
-              Learn & Grow
-              <svg class="swoosh-underline" width="175" height="12" viewBox="0 0 175 12" fill="none">
-                <path d="M3 9C55 3 120 3 172 9" stroke="#6366f1" stroke-width="4" stroke-linecap="round"/>
-              </svg>
-            </span>
-          </h1>
+          <h1 class="main-hero-heading">Learn without limits.</h1>
 
           <!-- Tagline Subtitle -->
           <p class="hero-subtitle">
-            Access courses, track your progress, submit assignments, and learn anytime, anywhere with EduVerse.
+            Sign in to continue learning, share your expertise, and grow with the EduVerse community.
           </p>
 
           <!-- Middle-Bottom Interactive Row: 3 Feature Cards on Left + Desk Laptop Artwork on Right -->
@@ -116,13 +105,23 @@ export type PortalType = 'student' | 'instructor' | 'admin';
               </div>
             </div>
 
-            <!-- Modern 3D Educational Artwork -->
+            <!-- Role-specific illustration -->
             <div class="hero-artwork-box">
-              <img
-                src="/assets/images/learning-hero-illustration.png"
-                alt="EduVerse Learning Hub"
-                class="hero-artwork-img"
-              />
+              <div class="role-illustration">
+                  <svg viewBox="0 0 220 220" role="img" aria-label="Learning resources on EduVerse">
+                    <circle cx="110" cy="106" r="87" fill="#eeecff"/>
+                    <rect x="52" y="106" width="116" height="72" rx="8" fill="#fff" stroke="#c8c2f5" stroke-width="3"/>
+                    <path d="M73 105V89a37 37 0 0 1 74 0v16" fill="#fff" stroke="#7166d9" stroke-width="4"/>
+                    <rect x="88" y="124" width="44" height="5" rx="2.5" fill="#d8d4f7"/>
+                    <rect x="88" y="137" width="44" height="5" rx="2.5" fill="#d8d4f7"/>
+                    <path d="M75 162h70" stroke="#8b82df" stroke-width="4" stroke-linecap="round"/>
+                    <path d="m31 55 18-9 18 9-18 9-18-9Z" fill="#8a80e5"/>
+                    <path d="M37 59v10c6 6 18 6 24 0V59" fill="none" stroke="#8a80e5" stroke-width="3"/>
+                    <circle cx="174" cy="53" r="17" fill="#fff" stroke="#dedafa" stroke-width="2"/>
+                    <path d="m166 53 6 6 11-13" fill="none" stroke="#45a486" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span class="illustration-caption">A space to learn and grow</span>
+              </div>
             </div>
           </div>
         </div>
@@ -142,76 +141,8 @@ export type PortalType = 'student' | 'instructor' | 'admin';
                 </div>
                 <span class="card-brand-title">EduVerse</span>
               </div>
-              <h2 class="card-welcome-title">Welcome Back</h2>
+              <h2 class="card-welcome-title">Welcome back</h2>
               <p class="card-welcome-sub">Sign in to your EduVerse account</p>
-            </div>
-
-            <!-- Role Selector Tabs -->
-            <div class="card-role-track" role="tablist">
-              <button
-                type="button"
-                class="role-pill-btn"
-                [class.active]="selectedRole === 'student'"
-                (click)="selectRole('student')"
-                role="tab"
-                [attr.aria-selected]="selectedRole === 'student'"
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M22 10v6M2 10l10-5 10 5-10 5z"/>
-                  <path d="M6 12v5c3 3 9 3 12 0v-5"/>
-                </svg>
-                <span>Student</span>
-              </button>
-
-              <button
-                type="button"
-                class="role-pill-btn"
-                [class.active]="selectedRole === 'instructor'"
-                (click)="selectRole('instructor')"
-                role="tab"
-                [attr.aria-selected]="selectedRole === 'instructor'"
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
-                  <circle cx="9" cy="7" r="4"/>
-                  <line x1="19" y1="8" x2="19" y2="14"/>
-                  <line x1="22" y1="11" x2="16" y2="11"/>
-                </svg>
-                <span>Instructor</span>
-              </button>
-
-              <button
-                type="button"
-                class="role-pill-btn"
-                [class.active]="selectedRole === 'admin'"
-                (click)="selectRole('admin')"
-                role="tab"
-                [attr.aria-selected]="selectedRole === 'admin'"
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect width="20" height="14" x="2" y="3" rx="2"/>
-                  <line x1="8" x2="16" y1="21" y2="21"/>
-                  <line x1="12" x2="12" y1="17" y2="21"/>
-                </svg>
-                <span>Admin</span>
-              </button>
-            </div>
-
-            <!-- Demo Credentials Quick Helper Bar -->
-            <div class="demo-quick-bar">
-              <button type="button" class="demo-autofill-btn" (click)="fillDemoCredentials()">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                <span>Fill {{ selectedRole | titlecase }}</span>
-              </button>
-              <span class="demo-cred-hint">
-                @if (selectedRole === 'admin') {
-                  admin&#64;eduverse.io &bull; pass: <code>admin</code>
-                } @else if (selectedRole === 'instructor') {
-                  sarah.chen&#64;eduverse.io &bull; pass: <code>EduVerseDemo2026!</code>
-                } @else {
-                  alex.rivera&#64;eduverse.io &bull; pass: <code>EduVerseDemo2026!</code>
-                }
-              </span>
             </div>
 
             <!-- Error or Info Alert -->
@@ -310,6 +241,11 @@ export type PortalType = 'student' | 'instructor' | 'admin';
                 }
               </div>
 
+              <label class="remember-me-option">
+                <input type="checkbox" [(ngModel)]="rememberMe" [ngModelOptions]="{ standalone: true }" />
+                <span>Remember me</span>
+              </label>
+
               <!-- Sign In Button -->
               <button
                 type="submit"
@@ -320,7 +256,7 @@ export type PortalType = 'student' | 'instructor' | 'admin';
                   <div class="btn-spinner"></div>
                   <span>Signing In...</span>
                 } @else {
-                  <span>Sign In</span>
+                  <span>Log in</span>
                   <span class="arrow-circle">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M5 12h14"/>
@@ -331,15 +267,10 @@ export type PortalType = 'student' | 'instructor' | 'admin';
               </button>
             </form>
 
-            <!-- Line Divider -->
             <div class="card-divider-line">
               <span class="divider-caption">New to EduVerse?</span>
             </div>
-
-            <!-- Create Account Button -->
-            <a routerLink="/register" [queryParams]="{ role: selectedRole === 'instructor' ? 'instructor' : 'student' }" class="create-account-pill-btn">
-              Create Account
-            </a>
+            <a routerLink="/register" class="create-account-pill-btn">Create an account</a>
           </div>
         </div>
       </main>
@@ -570,19 +501,33 @@ export type PortalType = 'student' | 'instructor' | 'admin';
       align-items: center;
       justify-content: center;
     }
-    .hero-artwork-img {
+    .role-illustration {
+      position: relative;
       width: 100%;
-      height: auto;
-      max-height: 250px;
-      object-fit: cover;
+      max-width: 290px;
+      aspect-ratio: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
       border-radius: 20px;
-      box-shadow: 0 16px 36px -10px rgba(99, 102, 241, 0.22), 0 0 1px 1px rgba(99, 102, 241, 0.08);
-      border: 1px solid rgba(255, 255, 255, 0.9);
-      transition: all 0.3s ease;
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.95);
+      box-shadow: 0 16px 36px -10px rgba(99, 102, 241, 0.16);
+      transition: transform 0.3s ease;
     }
-    .hero-artwork-img:hover {
+    .role-illustration:hover {
       transform: translateY(-3px) scale(1.01);
-      box-shadow: 0 20px 42px -10px rgba(99, 102, 241, 0.3);
+    }
+    .role-illustration svg {
+      width: 85%;
+      max-height: 225px;
+    }
+    .illustration-caption {
+      margin-top: 0.25rem;
+      color: #5b52ba;
+      font-size: 0.78rem;
+      font-weight: 700;
     }
 
     /* Right Login Card Column */
@@ -640,90 +585,6 @@ export type PortalType = 'student' | 'instructor' | 'admin';
       margin: 0;
     }
 
-    /* Role Tabs */
-    .card-role-track {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 4px;
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 4px;
-      margin-bottom: 1.35rem;
-    }
-    .role-pill-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.4rem;
-      padding: 0.55rem 0.35rem;
-      border-radius: 8px;
-      border: none;
-      background: transparent;
-      color: #475569;
-      font-size: 0.825rem;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-    .role-pill-btn:hover:not(.active) {
-      color: #0f172a;
-      background-color: #f1f5f9;
-    }
-    .role-pill-btn.active {
-      background: #4f46e5;
-      color: #ffffff;
-      font-weight: 600;
-      box-shadow: 0 2px 8px rgba(79, 70, 229, 0.28);
-    }
-
-    /* Demo Quick Bar */
-    .demo-quick-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 0.5rem;
-      background: #f8fafc;
-      border: 1px dashed #cbd5e1;
-      border-radius: 10px;
-      padding: 0.45rem 0.65rem;
-      margin-bottom: 1.15rem;
-      font-size: 0.775rem;
-    }
-    .demo-autofill-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.35rem;
-      border: none;
-      background: #e0e7ff;
-      color: #4338ca;
-      font-size: 0.775rem;
-      font-weight: 700;
-      padding: 0.3rem 0.6rem;
-      border-radius: 6px;
-      cursor: pointer;
-      white-space: nowrap;
-      transition: all 0.2s ease;
-    }
-    .demo-autofill-btn:hover {
-      background: #4f46e5;
-      color: #ffffff;
-    }
-    .demo-cred-hint {
-      color: #64748b;
-      font-size: 0.74rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .demo-cred-hint code {
-      background: #e2e8f0;
-      padding: 1px 4px;
-      border-radius: 4px;
-      font-weight: 600;
-      color: #334155;
-    }
-
     /* Alerts */
     .card-message {
       display: flex;
@@ -750,6 +611,20 @@ export type PortalType = 'student' | 'instructor' | 'admin';
       display: flex;
       flex-direction: column;
       gap: 1.1rem;
+    }
+    .remember-me-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      color: #475569;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .remember-me-option input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: #4f46e5;
     }
     .field-wrapper {
       display: flex;
@@ -937,6 +812,17 @@ export type PortalType = 'student' | 'instructor' | 'admin';
       background-color: #f5f3ff;
       border-color: #4338ca;
     }
+    .back-selection-link {
+      display: block;
+      margin-top: 1.1rem;
+      color: #64748b;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-align: center;
+    }
+    .back-selection-link:hover {
+      color: #4338ca;
+    }
 
     /* Responsive Design */
     @media (max-width: 1100px) {
@@ -967,59 +853,23 @@ export type PortalType = 'student' | 'instructor' | 'admin';
     }
   `]
 })
-export class LoginComponent implements OnInit {
+export class LoginComponent {
   loginForm: FormGroup;
-  selectedRole: PortalType = 'student';
+  rememberMe = true;
   showPassword = false;
   isLoading = false;
   errorMessage = '';
   infoNotice = '';
-  returnUrl = '';
 
   constructor(
     private fb: FormBuilder,
     private auth: AuthService,
-    private router: Router,
-    private route: ActivatedRoute
+    private router: Router
   ) {
     this.loginForm = this.fb.group({
       email: ['', [Validators.required, Validators.email]],
       password: ['', [Validators.required]]
     });
-  }
-
-  ngOnInit(): void {
-    this.returnUrl = this.route.snapshot.queryParams['returnUrl'] || '';
-    const roleParam = this.route.snapshot.queryParams['role'] || this.route.snapshot.queryParams['portal'];
-    if (roleParam === 'instructor' || roleParam === 'admin' || roleParam === 'student') {
-      this.selectedRole = roleParam;
-    }
-  }
-
-  selectRole(role: PortalType): void {
-    this.selectedRole = role;
-    this.errorMessage = '';
-    this.infoNotice = '';
-  }
-
-  fillDemoCredentials(): void {
-    if (this.selectedRole === 'admin') {
-      this.loginForm.patchValue({
-        email: 'admin@eduverse.io',
-        password: 'admin'
-      });
-    } else if (this.selectedRole === 'instructor') {
-      this.loginForm.patchValue({
-        email: 'sarah.chen@eduverse.io',
-        password: 'EduVerseDemo2026!'
-      });
-    } else {
-      this.loginForm.patchValue({
-        email: 'alex.rivera@eduverse.io',
-        password: 'EduVerseDemo2026!'
-      });
-    }
-    this.errorMessage = '';
   }
 
   isFieldInvalid(field: string): boolean {
@@ -1030,14 +880,6 @@ export class LoginComponent implements OnInit {
   onForgotPassword(event: Event): void {
     event.preventDefault();
     this.infoNotice = 'To reset your credentials, please contact your institution platform administrator or email support@eduverse.io.';
-  }
-
-  onNavClick(target: string): void {
-    if (target === 'about') {
-      this.infoNotice = 'EduVerse LMS is an enterprise learning management platform built for modern academic and technical training.';
-    } else if (target === 'support') {
-      this.infoNotice = 'For support and technical assistance, please reach out to support@eduverse.io.';
-    }
   }
 
   onSubmit(): void {
@@ -1052,39 +894,15 @@ export class LoginComponent implements OnInit {
       password: this.loginForm.value.password
     };
 
-    this.auth.login(credentials).subscribe({
+    this.auth.login(credentials, this.rememberMe).subscribe({
       next: (res) => {
         this.isLoading = false;
-        const userRole = res.user.role;
-
-        if (this.returnUrl) {
-          this.router.navigateByUrl(this.returnUrl);
-          return;
-        }
-
-        // Direct routing based on selected role and user role
-        if (this.selectedRole === 'admin') {
-          if (userRole === 'admin') {
-            this.router.navigate(['/admin/dashboard']);
-          } else {
-            this.router.navigate([userRole === 'instructor' ? '/instructor/dashboard' : '/student/dashboard']);
-          }
-        } else if (this.selectedRole === 'instructor') {
-          if (userRole === 'instructor' || userRole === 'admin') {
-            this.router.navigate(['/instructor/dashboard']);
-          } else {
-            this.router.navigate(['/student/dashboard']);
-          }
-        } else {
-          // Student role
-          if (userRole === 'admin') {
-            this.router.navigate(['/admin/dashboard']);
-          } else if (userRole === 'instructor') {
-            this.router.navigate(['/instructor/dashboard']);
-          } else {
-            this.router.navigate(['/student/dashboard']);
-          }
-        }
+        const dashboardByRole = {
+          student: '/student/dashboard',
+          instructor: '/instructor/dashboard',
+          admin: '/admin/dashboard'
+        };
+        this.router.navigateByUrl(dashboardByRole[res.user.role]);
       },
       error: (err) => {
         this.isLoading = false;

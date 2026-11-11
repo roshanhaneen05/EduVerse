@@ -17,6 +17,12 @@ import { AuthService } from '../../core/services/auth.service';
           <div class="spinner"></div>
           <span>Loading course syllabus...</span>
         </div>
+      } @else if (loadError) {
+        <div class="container not-found card">
+          <h2>Unable to Load Course</h2>
+          <p>{{ loadError }}</p>
+          <button (click)="retryLoadCourse()" class="btn btn-primary">Retry</button>
+        </div>
       } @else if (!course) {
         <div class="container not-found card">
           <h2>Course Not Found</h2>
@@ -74,6 +80,12 @@ import { AuthService } from '../../core/services/auth.service';
                 }
               </div>
 
+              @if (enrollMessage) {
+                <div class="alert" [ngClass]="isEnrollError ? 'alert-danger' : 'alert-success'">
+                  {{ enrollMessage }}
+                </div>
+              }
+
               @if (course.is_enrolled) {
                 <div class="progress-box">
                   <div class="progress-header">
@@ -104,13 +116,7 @@ import { AuthService } from '../../core/services/auth.service';
                   Gain lifetime access to all lessons, interactive knowledge checks, and verifiable completion certificates.
                 </p>
 
-                @if (enrollMessage) {
-                  <div class="alert" [ngClass]="isEnrollError ? 'alert-danger' : 'alert-success'">
-                    {{ enrollMessage }}
-                  </div>
-                }
-
-                @if (auth.isAuthenticated()) {
+                @if (auth.isStudent()) {
                   <button (click)="enroll()" class="btn btn-primary btn-block btn-lg" [disabled]="isEnrolling">
                     @if (isEnrolling) {
                       <span>Enrolling...</span>
@@ -118,6 +124,8 @@ import { AuthService } from '../../core/services/auth.service';
                       <span>Enroll in Course</span>
                     }
                   </button>
+                } @else if (auth.isAuthenticated()) {
+                  <p class="enroll-perk">Only student accounts can enroll in courses.</p>
                 } @else {
                   <a [routerLink]="['/login']" [queryParams]="{ returnUrl: '/courses/' + course.id }" class="btn btn-primary btn-block btn-lg">
                     Sign In to Enroll
@@ -774,6 +782,7 @@ import { AuthService } from '../../core/services/auth.service';
 export class CourseDetailComponent implements OnInit {
   @Input() id!: string; // Bound from router param :id
   course: CourseDetail | null = null;
+  loadError = '';
   isLoading = true;
   isEnrolling = false;
   enrollMessage = '';
@@ -794,16 +803,29 @@ export class CourseDetailComponent implements OnInit {
 
   loadCourse(courseId: number): void {
     this.isLoading = true;
+    this.loadError = '';
     this.courseService.getCourse(courseId).subscribe({
       next: (data) => {
         this.course = data;
         this.isLoading = false;
       },
-      error: () => {
+      error: (error) => {
         this.course = null;
         this.isLoading = false;
+        if (error.status !== 404) {
+          this.loadError = error.status === 0
+            ? 'Could not reach the EduVerse API. Check that the backend is running and its database migrations are applied.'
+            : error.error?.detail || 'An unexpected error occurred while loading this course.';
+        }
       }
     });
+  }
+
+  retryLoadCourse(): void {
+    const courseId = Number(this.id);
+    if (Number.isInteger(courseId) && courseId > 0) {
+      this.loadCourse(courseId);
+    }
   }
 
   enroll(): void {
@@ -813,9 +835,15 @@ export class CourseDetailComponent implements OnInit {
     this.isEnrollError = false;
 
     this.courseService.enrollInCourse(this.course.id).subscribe({
-      next: () => {
+      next: (enrollment) => {
         this.isEnrolling = false;
-        this.enrollMessage = 'Successfully enrolled! You may now begin your lessons.';
+        this.enrollMessage = enrollment.email_notification_status === 'sent'
+          ? 'Successfully enrolled! Your instructor has been notified. You may now begin your lessons.'
+          : enrollment.email_notification_status === 'not_configured'
+            ? 'Successfully enrolled! Your instructor email notification is not configured yet.'
+            : enrollment.email_notification_status === 'failed'
+              ? 'Successfully enrolled, but the instructor email could not be sent. Please contact support.'
+              : 'Successfully enrolled! You may now begin your lessons.';
         this.course!.is_enrolled = true;
         this.course!.user_progress_percentage = 0;
       },
@@ -874,4 +902,3 @@ export class CourseDetailComponent implements OnInit {
     }
   }
 }
-

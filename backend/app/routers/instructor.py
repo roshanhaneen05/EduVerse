@@ -18,6 +18,7 @@ from app.models.quiz import (
 )
 from app.models.user import User
 from app.schemas.admin import InstructorDashboardStats
+from app.schemas.enrollment import InstructorEnrollmentResponse
 from app.schemas.analytics import (
     CourseAnalyticsResponse,
     CourseStudentReportResponse,
@@ -105,6 +106,43 @@ def get_instructor_stats(
     db: Session = Depends(get_db),
 ):
     return get_instructor_dashboard_analytics(db, current_user)
+
+
+@router.get(
+    "/enrollments",
+    response_model=List[InstructorEnrollmentResponse],
+    summary="List enrollments for courses managed by the authenticated instructor",
+)
+def get_instructor_enrollments(
+    current_user: User = Depends(require_instructor),
+    db: Session = Depends(get_db),
+):
+    query = (
+        db.query(CourseEnrollment)
+        .join(Course, Course.id == CourseEnrollment.course_id)
+        .options(
+            joinedload(CourseEnrollment.student),
+            joinedload(CourseEnrollment.course),
+        )
+    )
+    if current_user.role != "admin":
+        query = query.filter(Course.instructor_id == current_user.id)
+
+    enrollments = query.order_by(CourseEnrollment.enrolled_at.desc()).all()
+    return [
+        InstructorEnrollmentResponse(
+            enrollment_id=enrollment.id,
+            student_id=enrollment.student_id,
+            student_name=enrollment.student.full_name,
+            student_email=enrollment.student.email,
+            course_id=enrollment.course_id,
+            course_name=enrollment.course.title,
+            instructor_id=enrollment.course.instructor_id,
+            enrolled_at=enrollment.enrolled_at,
+            status=enrollment.status,
+        )
+        for enrollment in enrollments
+    ]
 
 
 @router.get(
@@ -1019,5 +1057,4 @@ def grade_student_submission(
     db: Session = Depends(get_db),
 ):
     return service_grade_submission(db, submission_id, grade_in, current_user)
-
 

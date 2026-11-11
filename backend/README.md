@@ -99,3 +99,14 @@ cd C:\EduVerse\backend
 # Run the complete test suite:
 .\.venv\Scripts\python.exe -m pytest -v
 ```
+
+## 5. Additive Demo Data
+
+Run the idempotent demo seeder from the backend directory:
+
+```powershell
+cd C:\Users\SWATHY\EduVerse\backend
+..\.venv\Scripts\python.exe .\seed_data.py
+```
+
+The script writes only to the existing `data\eduverse.db`, uses the application's Argon2 password hasher, and does not update or delete existing rows. It reuses matching demo accounts and course records. Newly created demo accounts use `EduVerseDemo2026!` unless `DEMO_PASSWORD` is set in the environment. The script prints per-table insert counts, final table totals, and the foreign-key integrity result.

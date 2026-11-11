@@ -27,6 +27,8 @@
 | `PUT` | `/profile` | Update profile information | Authenticated |
 | `PUT` | `/password` | Change user password | Authenticated |
 
+`POST /api/v1/auth/login` accepts `email`, `password`, and optional `remember_me` (default `true`). The server verifies the stored password hash and returns the role from the matching database user; clients must not submit or select a role. The frontend routes students, instructors, and administrators to their respective dashboards. Setting `remember_me` to `false` makes the authentication cookie session-only.
+
 ---
 
 ## 3. Course Catalog & Enrollment (`/api/v1/courses`)
@@ -67,6 +69,8 @@
 | Method | Endpoint | Description | Role |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/instructor/dashboard` | Instructor statistics and recent student enrollments | Instructor / Admin |
+| `GET` | `/instructor/enrollments` | List student name, email, course, enrollment date, and status for the instructor's courses | Instructor / Admin |
+| `POST` | `/admin/email/test` | Send a test message to the supplied recipient (development only) | Admin |
 | `GET` | `/instructor/courses` | List courses owned by instructor | Instructor / Admin |
 | `POST` | `/instructor/courses` | Create new course | Instructor / Admin |
 | `PUT` | `/instructor/courses/{id}` | Update course metadata | Course Owner / Admin |
@@ -80,6 +84,24 @@
 | `POST` | `/instructor/courses/{id}/quizzes` | Create quiz with questions and answers | Course Owner / Admin |
 | `DELETE` | `/instructor/quizzes/{id}` | Delete quiz | Course Owner / Admin |
 
+### Enrollment email notifications
+
+Successful student enrollment is committed before the backend attempts an instructor notification. The response includes `email_notification_status` (`sent`, `failed`, or `not_configured`); an SMTP failure does not undo the enrollment. Notification delivery uses the assigned instructor's address from the database.
+
+Configure these values in `backend/.env` (see `backend/.env.example`): `EMAIL_HOST=smtp.gmail.com`, `EMAIL_PORT=587`, `EMAIL_USE_TLS=true`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL`. Enable 2-Step Verification on the sending Google account and create an App Password; use that App Password for `EMAIL_HOST_PASSWORD`, not your normal account password. Set `DEFAULT_FROM_EMAIL` to the sending address. SMTP credentials remain backend-only. The legacy `SMTP_*` environment names are accepted for compatibility. Restart the backend after editing `.env`.
+
+To check connectivity and send a notification, start the backend, authenticate as a student, and `POST /api/v1/courses/{course_id}/enroll` for a published course that does not already have an enrollment for that student. A successful response reports `email_notification_status: "sent"` only after Gmail accepts the message; `failed` and `not_configured` are logged and enrollment remains saved. A second request for the same student/course returns `409` and does not send another email.
+
+An administrator can test SMTP without enrolling a student by posting `{"recipient_email":"you@example.com"}` to `/api/v1/admin/email/test` with the admin bearer token. This endpoint exists only when `ENVIRONMENT=development`; it reports success only after SMTP accepts the message and never returns credentials.
+
+The enrollment status migration and any remaining migrations can be applied from `backend` with:
+
+```powershell
+python -m alembic upgrade head
+```
+
+If the backend virtual environment is activated, `alembic upgrade head` is equivalent. Existing enrollments are retained; rows with 100% completion are marked `completed`, and the rest are marked `active`.
+
 ---
 
 ## 7. Administrator Portal (`/api/v1/admin`)
@@ -90,6 +112,18 @@
 | `GET` | `/admin/users` | List, search, and filter platform users | Admin |
 | `PUT` | `/admin/users/{id}` | Update user role (e.g. promote) or active status | Admin |
 | `PATCH` | `/admin/courses/{id}/publish` | Toggle publication on any course | Admin |
+| `GET` | `/admin/analytics/dashboard` | Consolidated overview, student, course, instructor, trend, and activity analytics | Admin |
+| `GET` | `/admin/analytics/overview` | Platform summary statistics | Admin |
+| `GET` | `/admin/analytics/students` | Student counts, enrollment metrics, and performance rankings | Admin |
+| `GET` | `/admin/analytics/courses` | Course counts, categories, enrollment, and completion rankings | Admin |
+| `GET` | `/admin/analytics/instructors` | Instructor course and enrollment metrics | Admin |
+| `GET` | `/admin/analytics/trends` | Monthly registrations, enrollments, and lesson activity | Admin |
+| `GET` | `/admin/analytics/activities` | Recent registrations, course creation, enrollments, and completions | Admin |
+| `GET` | `/admin/analytics/export?format=csv\|pdf` | Download a CSV or PDF analytics report | Admin |
+
+Analytics routes accept optional `start_date` and `end_date` query parameters in `YYYY-MM-DD` format. Supply both dates together; the start and end dates are inclusive. Account totals, active-account counts, and published-course totals are lifetime values. Enrollment, completion, new-registration, activity, and trend values use the selected period where applicable. Student activity is based on recorded lesson-progress updates; course completion activity uses completed lesson timestamps and completed enrollment records. These analytics endpoints do not return student email addresses or other contact details. No database migration is required.
+
+The Angular dashboard is available at `/admin/analytics` and is limited to authenticated administrators by the existing role guard. The API independently enforces the administrator role.
 
 ---
 
@@ -101,4 +135,3 @@
 | `GET` | `/ai/conversations` | List conversation histories | Authenticated |
 | `GET` | `/ai/conversations/{id}` | Retrieve messages in conversation | Authenticated |
 | `DELETE` | `/ai/conversations/{id}` | Delete conversation | Authenticated |
-

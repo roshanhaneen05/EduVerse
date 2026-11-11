@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
+import logging
+import smtplib
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_current_user, get_db
@@ -13,7 +16,9 @@ from app.schemas.common import MessageResponse
 from app.schemas.course import CourseDetailResponse, CourseResponse, LessonOutlineItem
 from app.schemas.enrollment import EnrollmentResponse
 from app.schemas.section import SectionDetailResponse
-from app.security.rbac import get_token_from_request
+from app.security.rbac import get_token_from_request, require_student
+from app.config import get_settings
+from app.services.email_service import EmailNotConfiguredError, send_enrollment_email
 from app.services.course_service import (
     enrich_course_response,
     get_course_detail,
@@ -21,6 +26,8 @@ from app.services.course_service import (
 )
 
 router = APIRouter(prefix="/courses", tags=["Courses & Catalog"])
+logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 def get_optional_user(
@@ -84,7 +91,7 @@ def get_course(
 )
 def enroll_in_course(
     course_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     course = db.query(Course).filter(Course.id == course_id).first()
@@ -93,10 +100,16 @@ def enroll_in_course(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found.",
         )
-    if not course.is_published and current_user.role not in ("instructor", "admin"):
+    if not course.is_published:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot enroll in an unpublished course.",
+        )
+    instructor = course.instructor
+    if not instructor or instructor.role != "instructor" or not instructor.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="This course does not have an active instructor assigned.",
         )
 
     # Prevent duplicate enrollment
@@ -119,10 +132,41 @@ def enroll_in_course(
         course_id=course_id,
         enrolled_at=datetime.now(timezone.utc),
         completion_percentage=0.0,
+        status="active",
     )
     db.add(enrollment)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        duplicate = db.query(CourseEnrollment).filter(
+            CourseEnrollment.student_id == current_user.id,
+            CourseEnrollment.course_id == course_id,
+        ).first()
+        if duplicate:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You are already enrolled in this course.",
+            ) from exc
+        raise
     db.refresh(enrollment)
+
+    email_notification_status = "sent"
+    try:
+        send_enrollment_email(enrollment, current_user, course, instructor, settings)
+    except EmailNotConfiguredError as exc:
+        email_notification_status = "not_configured"
+        logger.warning(
+            "Enrollment %s saved, but instructor email is not configured: %s",
+            enrollment.id,
+            exc,
+        )
+    except (smtplib.SMTPException, OSError, ValueError):
+        email_notification_status = "failed"
+        logger.exception(
+            "Enrollment %s was saved, but instructor email delivery failed",
+            enrollment.id,
+        )
 
     enriched_course = enrich_course_response(db, course)
     return EnrollmentResponse(
@@ -131,6 +175,12 @@ def enroll_in_course(
         course_id=enrollment.course_id,
         enrolled_at=enrollment.enrolled_at,
         completion_percentage=enrollment.completion_percentage,
+        status=enrollment.status,
+        student_name=current_user.full_name,
+        student_email=current_user.email,
+        course_name=course.title,
+        instructor_id=instructor.id,
+        email_notification_status=email_notification_status,
         course=enriched_course,
     )
 

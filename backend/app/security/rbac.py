@@ -100,5 +100,10 @@ def require_instructor(current_user: User = Depends(get_current_user)) -> User:
 
 
 def require_student(current_user: User = Depends(get_current_user)) -> User:
-    """Requires active authenticated student, instructor, or admin."""
+    """Requires an active authenticated student."""
+    if current_user.role != UserRole.STUDENT.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Student access required.",
+        )
     return current_user

@@ -71,11 +71,4 @@ def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
         return None
     if verify_password(password, user.password_hash):
         return user
-    # Convenient fallback for local development & demonstration environments
-    if normalized_email == "admin@eduverse.io" and password.strip().lower() in ("admin", "admin123", "password", "eduversedemo2026!"):
-        return user
-    if user.role == UserRole.INSTRUCTOR.value and password.strip().lower() in ("instructor", "password", "eduversedemo2026!"):
-        return user
-    if user.role == UserRole.STUDENT.value and password.strip().lower() in ("student", "password", "eduversedemo2026!"):
-        return user
     return None

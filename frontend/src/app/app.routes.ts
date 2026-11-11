@@ -6,18 +6,46 @@ export const routes: Routes = [
   // Public Routes
   {
     path: '',
-    redirectTo: 'login',
-    pathMatch: 'full'
+    loadComponent: () => import('./pages/landing/landing.component').then(m => m.LandingComponent),
+    title: 'Learn & Grow - EduVerse'
   },
   {
     path: 'login',
     loadComponent: () => import('./pages/login/login.component').then(m => m.LoginComponent),
-    title: 'Portal Sign In - EduVerse'
+    title: 'Sign In - EduVerse'
+  },
+  {
+    path: 'student/login',
+    redirectTo: 'login',
+    pathMatch: 'full'
+  },
+  {
+    path: 'instructor/login',
+    redirectTo: 'login',
+    pathMatch: 'full'
+  },
+  {
+    path: 'admin/login',
+    redirectTo: 'login',
+    pathMatch: 'full'
   },
   {
     path: 'register',
+    loadComponent: () => import('./pages/account-selection/account-selection.component').then(m => m.AccountSelectionComponent),
+    data: { mode: 'register' },
+    title: 'Choose Your Account - EduVerse'
+  },
+  {
+    path: 'student/register',
     loadComponent: () => import('./pages/register/register.component').then(m => m.RegisterComponent),
-    title: 'Register Student Account - EduVerse'
+    data: { role: 'student' },
+    title: 'Student Registration - EduVerse'
+  },
+  {
+    path: 'instructor/register',
+    loadComponent: () => import('./pages/register/register.component').then(m => m.RegisterComponent),
+    data: { role: 'instructor' },
+    title: 'Instructor Registration - EduVerse'
   },
   {
     path: 'courses',
@@ -77,25 +105,29 @@ export const routes: Routes = [
   },
   {
     path: 'student/dashboard',
-    canActivate: [authGuard],
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['student'] },
     loadComponent: () => import('./pages/student/student-dashboard.component').then(m => m.StudentDashboardComponent),
     title: 'Student Dashboard - EduVerse'
   },
   {
     path: 'student/my-learning',
-    canActivate: [authGuard],
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['student'] },
     loadComponent: () => import('./pages/student/my-learning.component').then(m => m.MyLearningComponent),
     title: 'My Learning - EduVerse'
   },
   {
     path: 'student/assignments',
-    canActivate: [authGuard],
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['student'] },
     loadComponent: () => import('./pages/student/student-assignments.component').then(m => m.StudentAssignmentsComponent),
     title: 'My Assignments & Tasks - EduVerse'
   },
   {
     path: 'student/quiz-history',
-    canActivate: [authGuard],
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['student'] },
     loadComponent: () => import('./pages/student/student-quiz-history.component').then(m => m.StudentQuizHistoryComponent),
     title: 'Assessment History - EduVerse'
   },
@@ -176,6 +208,13 @@ export const routes: Routes = [
     data: { roles: ['admin'] },
     loadComponent: () => import('./pages/admin/admin-dashboard.component').then(m => m.AdminDashboardComponent),
     title: 'Administrator Governance - EduVerse'
+  },
+  {
+    path: 'admin/analytics',
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['admin'] },
+    loadComponent: () => import('./pages/admin/admin-analytics.component').then(m => m.AdminAnalyticsComponent),
+    title: 'Admin Analytics - EduVerse'
   },
   {
     path: 'admin/users',

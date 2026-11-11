@@ -2,7 +2,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db
+from app.dependencies import get_db, require_student
 from app.models.user import User
 from app.schemas.course import CourseResponse
 from app.schemas.student import (
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/student", tags=["Student Experience & Learning"])
     summary="Get comprehensive student dashboard metrics, deadlines, and real telemetry",
 )
 def get_student_dashboard(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """
@@ -52,7 +52,7 @@ def get_student_dashboard(
 )
 def get_my_learning(
     status: Optional[str] = Query(None, description="Filter by status ('all', 'in_progress', 'completed')"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """
@@ -69,7 +69,7 @@ def get_my_learning(
 )
 def continue_course_learning(
     course_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """
@@ -88,7 +88,7 @@ def continue_course_learning(
 )
 def get_student_assignments(
     filter: Optional[str] = Query(None, description="Filter by status ('all', 'pending', 'submitted', 'graded', 'past_due')"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """
@@ -104,7 +104,7 @@ def get_student_assignments(
     summary="Get student quiz examination history",
 )
 def get_student_quiz_history(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """
@@ -121,7 +121,7 @@ def get_student_quiz_history(
 )
 def get_course_recommendations(
     limit: int = Query(4, ge=1, le=10, description="Max recommendations to return"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     """

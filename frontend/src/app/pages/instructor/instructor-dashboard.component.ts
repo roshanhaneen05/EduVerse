@@ -4,6 +4,7 @@ import { RouterLink } from '@angular/router';
 import { InstructorService } from '../../core/services/instructor.service';
 import { EnhancedInstructorDashboardStats } from '../../core/models/analytics.model';
 import { Course } from '../../core/models/course.model';
+import { InstructorEnrollment } from '../../core/models/enrollment.model';
 
 @Component({
   selector: 'app-instructor-dashboard',
@@ -172,13 +173,18 @@ import { Course } from '../../core/models/course.model';
             }
           </div>
 
-          <!-- Recent Student Enrollments -->
-          @if (stats && stats.recent_enrollments.length > 0) {
-            <div class="section-block">
-              <div class="section-header">
-                <h2>Recent Student Enrollments</h2>
-              </div>
+          <div class="section-block">
+            <div class="section-header">
+              <h2>Student Enrollments</h2>
+              <span class="badge badge-neutral">{{ enrollments.length }} Students</span>
+            </div>
 
+            @if (enrollments.length === 0) {
+              <div class="empty-block card">
+                <h3>No student enrollments yet</h3>
+                <p>Student enrollments in your courses will appear here.</p>
+              </div>
+            } @else {
               <div class="table-container card">
                 <table>
                   <thead>
@@ -186,32 +192,29 @@ import { Course } from '../../core/models/course.model';
                       <th>Student Name</th>
                       <th>Email</th>
                       <th>Course</th>
-                      <th>Progress</th>
-                      <th>Enrolled Date</th>
+                      <th>Enrollment Date</th>
+                      <th>Status</th>
                     </tr>
                   </thead>
                   <tbody>
-                    @for (enr of stats.recent_enrollments; track enr.enrollment_id) {
+                    @for (enr of enrollments; track enr.enrollment_id) {
                       <tr>
                         <td><strong>{{ enr.student_name }}</strong></td>
                         <td>{{ enr.student_email }}</td>
-                        <td>{{ enr.course_title }}</td>
-                        <td>
-                          <div class="table-progress">
-                            <span>{{ enr.completion_percentage }}%</span>
-                            <div class="mini-bar">
-                              <div class="mini-fill" [style.width.%]="enr.completion_percentage"></div>
-                            </div>
-                          </div>
-                        </td>
+                        <td>{{ enr.course_name }}</td>
                         <td>{{ enr.enrolled_at | date:'short' }}</td>
+                        <td>
+                          <span class="badge" [ngClass]="enr.status === 'completed' ? 'badge-success' : 'badge-primary'">
+                            {{ enr.status === 'completed' ? 'Completed' : 'Active' }}
+                          </span>
+                        </td>
                       </tr>
                     }
                   </tbody>
                 </table>
               </div>
-            </div>
-          }
+            }
+          </div>
         }
       </div>
     </div>
@@ -399,6 +402,7 @@ import { Course } from '../../core/models/course.model';
 export class InstructorDashboardComponent implements OnInit {
   stats: EnhancedInstructorDashboardStats | null = null;
   myCourses: Course[] = [];
+  enrollments: InstructorEnrollment[] = [];
   isLoading = true;
   errorMessage = '';
 
@@ -418,7 +422,16 @@ export class InstructorDashboardComponent implements OnInit {
         this.instructorService.getMyCourses().subscribe({
           next: (courses) => {
             this.myCourses = courses;
-            this.isLoading = false;
+            this.instructorService.getStudentEnrollments().subscribe({
+              next: (enrollments) => {
+                this.enrollments = enrollments;
+                this.isLoading = false;
+              },
+              error: (err) => {
+                this.isLoading = false;
+                this.errorMessage = err.error?.detail || 'Failed to load student enrollments.';
+              }
+            });
           },
           error: (err) => {
             this.isLoading = false;

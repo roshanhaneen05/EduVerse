@@ -16,11 +16,14 @@ export const roleGuard: CanActivateFn = (route, state) => {
   }
 
   const currentUser = authService.currentUser();
-  if (currentUser && (expectedRoles.includes(currentUser.role) || currentUser.role === 'admin')) {
+  if (currentUser && expectedRoles.includes(currentUser.role)) {
     return true;
   }
 
-  // Not authorized: redirect to root or student dashboard
-  return router.createUrlTree(['/student/dashboard']);
+  const roleDashboard: Record<string, string> = {
+    student: '/student/dashboard',
+    instructor: '/instructor/dashboard',
+    admin: '/admin/dashboard'
+  };
+  return router.createUrlTree([roleDashboard[currentUser?.role ?? ''] ?? '/']);
 };
-

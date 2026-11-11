@@ -11,14 +11,14 @@ import { FooterComponent } from './layout/footer/footer.component';
   standalone: true,
   imports: [RouterOutlet, NavbarComponent, FooterComponent, CommonModule],
   template: `
-    <div class="app-layout" [class.is-auth-page]="isAuthPage()">
-      @if (!isAuthPage()) {
+    <div class="app-layout" [class.is-standalone-page]="isStandalonePage()">
+      @if (!isStandalonePage()) {
         <app-navbar></app-navbar>
       }
-      <main class="app-content" [class.no-nav]="isAuthPage()">
+      <main class="app-content" [class.standalone-page]="isStandalonePage()">
         <router-outlet></router-outlet>
       </main>
-      @if (!isAuthPage()) {
+      @if (!isStandalonePage()) {
         <app-footer></app-footer>
       }
     </div>
@@ -29,20 +29,19 @@ import { FooterComponent } from './layout/footer/footer.component';
       display: flex;
       flex-direction: column;
     }
-    .app-layout.is-auth-page {
-      min-height: 100vh;
-      height: 100vh;
-      overflow-x: hidden;
-    }
     .app-content {
       flex: 1 0 auto;
       display: flex;
       flex-direction: column;
     }
-    .app-content.no-nav {
-      flex: 1;
+    .app-content.standalone-page {
+      display: block;
+      flex: 1 0 auto;
       min-height: 100vh;
       overflow-x: hidden;
+    }
+    .app-layout.is-standalone-page {
+      min-height: 100vh;
     }
   `]
 })
@@ -50,16 +49,20 @@ export class AppComponent {
   title = 'EduVerse';
   private router = inject(Router);
 
-  isAuthPage = toSignal(
+  isStandalonePage = toSignal(
     this.router.events.pipe(
       filter(e => e instanceof NavigationEnd),
-      map(() => this.checkAuth())
+      map(() => this.checkStandalonePage())
     ),
-    { initialValue: this.checkAuth() }
+    { initialValue: this.checkStandalonePage() }
   );
 
-  private checkAuth(): boolean {
+  private checkStandalonePage(): boolean {
     const p = window.location.pathname;
-    return p === '/login' || p.startsWith('/login?');
+    return p === '/'
+      || p === '/login'
+      || p === '/student/login'
+      || p === '/instructor/login'
+      || p === '/admin/login';
   }
 }

@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Union
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_file=str(BACKEND_DIR / ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
+        populate_by_name=True,
         extra="ignore",
     )
 
@@ -36,7 +37,36 @@ class Settings(BaseSettings):
     STORAGE_PROVIDER_TYPE: str = "local"
 
     # CORS
-    CORS_ORIGINS: Union[List[str], str] = "http://localhost:4200,http://127.0.0.1:4200"
+    CORS_ORIGINS: Union[List[str], str] = (
+        "http://localhost:4200,http://127.0.0.1:4200,http://[::1]:4200"
+    )
+
+    # Gmail SMTP is the default transport; credentials are supplied outside source control.
+    EMAIL_HOST: str = Field(
+        default="smtp.gmail.com",
+        validation_alias=AliasChoices("EMAIL_HOST", "SMTP_HOST"),
+    )
+    EMAIL_PORT: int = Field(
+        default=587,
+        validation_alias=AliasChoices("EMAIL_PORT", "SMTP_PORT"),
+    )
+    EMAIL_USE_TLS: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMAIL_USE_TLS", "SMTP_STARTTLS"),
+    )
+    EMAIL_HOST_USER: str = Field(
+        default="",
+        validation_alias=AliasChoices("EMAIL_HOST_USER", "SMTP_USERNAME"),
+    )
+    EMAIL_HOST_PASSWORD: str = Field(
+        default="",
+        validation_alias=AliasChoices("EMAIL_HOST_PASSWORD", "SMTP_PASSWORD"),
+    )
+    DEFAULT_FROM_EMAIL: str = Field(
+        default="",
+        validation_alias=AliasChoices("DEFAULT_FROM_EMAIL", "SMTP_FROM_EMAIL"),
+    )
+    EMAIL_TIMEOUT_SECONDS: int = 10
 
     # Server
     HOST: str = "127.0.0.1"
@@ -100,4 +130,3 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
-

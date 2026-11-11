@@ -230,6 +230,7 @@ def list_student_enrolled_courses(
                 enrolled_at=enr.enrolled_at,
                 completion_percentage=enr.completion_percentage,
                 status=status_val,
+                enrollment_status=enr.status,
                 total_lessons=tot_lessons,
                 completed_lessons=comp_lessons,
                 remaining_lessons=rem_lessons,

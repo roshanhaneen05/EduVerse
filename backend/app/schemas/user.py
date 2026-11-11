@@ -16,6 +16,7 @@ class UserCreate(UserBase):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    remember_me: bool = True
 
 
 class UserUpdateProfile(BaseModel):

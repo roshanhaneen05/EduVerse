@@ -28,8 +28,8 @@ import { RouterLink } from '@angular/router';
             <h4>Platform</h4>
             <ul>
               <li><a routerLink="/login">Sign In to Portal</a></li>
-              <li><a routerLink="/register">Register Student Account</a></li>
-              <li><a routerLink="/register" [queryParams]="{ role: 'instructor' }">Register as Instructor</a></li>
+              <li><a routerLink="/student/register">Register Student Account</a></li>
+              <li><a routerLink="/instructor/register">Register as Instructor</a></li>
             </ul>
           </div>
 
@@ -140,4 +140,3 @@ import { RouterLink } from '@angular/router';
   `]
 })
 export class FooterComponent {}
-

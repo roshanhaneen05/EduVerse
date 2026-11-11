@@ -2,7 +2,7 @@ from typing import List
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session, joinedload
 
-from app.dependencies import get_current_user, get_db
+from app.dependencies import get_db, require_student
 from app.models.enrollment import CourseEnrollment
 from app.models.user import User
 from app.schemas.enrollment import EnrollmentResponse
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/enrollments", tags=["Student Enrollments"])
     summary="List courses currently enrolled by the authenticated user",
 )
 def get_my_enrollments(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
     enrollments = (
@@ -39,6 +39,11 @@ def get_my_enrollments(
                     course_id=enr.course_id,
                     enrolled_at=enr.enrolled_at,
                     completion_percentage=enr.completion_percentage,
+                    status=enr.status,
+                    student_name=current_user.full_name,
+                    student_email=current_user.email,
+                    course_name=enr.course.title,
+                    instructor_id=enr.course.instructor_id,
                     course=enriched,
                 )
             )

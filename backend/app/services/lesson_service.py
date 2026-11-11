@@ -144,6 +144,7 @@ def mark_lesson_complete(db: Session, lesson_id: int, user: User) -> LessonProgr
 
     if enrollment:
         enrollment.completion_percentage = completion_percentage
+        enrollment.status = "completed" if completion_percentage >= 100.0 else "active"
         db.commit()
 
     return LessonProgressResponse(

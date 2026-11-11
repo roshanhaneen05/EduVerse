@@ -111,6 +111,45 @@ import { AuthService } from '../../core/services/auth.service';
             </div>
           }
 
+          <div class="section-block">
+            <div class="section-header">
+              <div>
+                <h2>My Enrolled Courses</h2>
+                <p class="section-sub">Your current enrollment status and learning progress</p>
+              </div>
+              <a routerLink="/student/my-learning" class="panel-link">View All →</a>
+            </div>
+
+            @if (data.enrolled_courses.length === 0) {
+              <div class="empty-panel card">
+                <span class="empty-icon">🎓</span>
+                <p>You haven't enrolled in a course yet.</p>
+                <a routerLink="/courses" class="btn btn-primary">Browse Courses</a>
+              </div>
+            } @else {
+              <div class="rec-grid">
+                @for (course of data.enrolled_courses; track course.enrollment_id) {
+                  <div class="rec-card card">
+                    <div class="rec-top">
+                      <div class="badge-row">
+                        <span class="badge badge-primary">{{ course.course_category }}</span>
+                        <span class="badge" [ngClass]="course.enrollment_status === 'completed' ? 'badge-success' : 'badge-warning'">
+                          {{ course.enrollment_status === 'completed' ? 'Completed' : 'Active' }}
+                        </span>
+                      </div>
+                      <h3>{{ course.course_title }}</h3>
+                      <p class="rec-desc">{{ course.completion_percentage }}% course progress</p>
+                    </div>
+                    <div class="rec-footer">
+                      <span class="inst-name">Enrolled {{ course.enrolled_at | date:'mediumDate' }}</span>
+                      <a [routerLink]="['/courses', course.course_id]" class="btn btn-sm btn-outline">Open Course</a>
+                    </div>
+                  </div>
+                }
+              </div>
+            }
+          </div>
+
           <!-- Two-Column Operational Row: Upcoming Deadlines & Recent Grades -->
           <div class="two-col-grid">
             <!-- Upcoming Assignment Deadlines -->

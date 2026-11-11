@@ -22,6 +22,9 @@ import { PlatformStats } from '../../core/models/admin.model';
             <p class="subtitle">Platform-wide analytics, user directory governance, and curriculum oversight.</p>
           </div>
           <div class="header-actions">
+            <a routerLink="/admin/analytics" class="btn btn-primary">
+              Advanced Analytics →
+            </a>
             <a routerLink="/admin/users" class="btn btn-secondary">
               User Directory →
             </a>

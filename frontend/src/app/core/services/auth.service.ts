@@ -28,7 +28,7 @@ export class AuthService {
 
   private getStoredUser(): User | null {
     try {
-      const data = localStorage.getItem(this.USER_KEY);
+      const data = localStorage.getItem(this.USER_KEY) ?? sessionStorage.getItem(this.USER_KEY);
       return data ? JSON.parse(data) : null;
     } catch {
       return null;
@@ -36,18 +36,25 @@ export class AuthService {
   }
 
   getToken(): string | null {
-    return localStorage.getItem(this.TOKEN_KEY);
+    return localStorage.getItem(this.TOKEN_KEY) ?? sessionStorage.getItem(this.TOKEN_KEY);
   }
 
   register(payload: { full_name: string; email: string; password: string; role?: string }): Observable<User> {
     return this.http.post<User>(`${this.apiUrl}/register`, payload);
   }
 
-  login(payload: { email: string; password: string }): Observable<AuthResponse> {
-    return this.http.post<AuthResponse>(`${this.apiUrl}/login`, payload).pipe(
+  login(payload: { email: string; password: string }, rememberMe = true): Observable<AuthResponse> {
+    return this.http.post<AuthResponse>(`${this.apiUrl}/login`, {
+      ...payload,
+      remember_me: rememberMe
+    }).pipe(
       tap(res => {
-        localStorage.setItem(this.TOKEN_KEY, res.access_token);
-        localStorage.setItem(this.USER_KEY, JSON.stringify(res.user));
+        const storage = rememberMe ? localStorage : sessionStorage;
+        const otherStorage = rememberMe ? sessionStorage : localStorage;
+        otherStorage.removeItem(this.TOKEN_KEY);
+        otherStorage.removeItem(this.USER_KEY);
+        storage.setItem(this.TOKEN_KEY, res.access_token);
+        storage.setItem(this.USER_KEY, JSON.stringify(res.user));
         this.currentUser.set(res.user);
       })
     );
@@ -63,17 +70,21 @@ export class AuthService {
     );
   }
 
-  clearSession(): void {
+  clearSession(redirectToLogin = true): void {
     localStorage.removeItem(this.TOKEN_KEY);
     localStorage.removeItem(this.USER_KEY);
+    sessionStorage.removeItem(this.TOKEN_KEY);
+    sessionStorage.removeItem(this.USER_KEY);
     this.currentUser.set(null);
-    this.router.navigate(['/login']);
+    if (redirectToLogin) {
+      this.router.navigate(['/login']);
+    }
   }
 
   getMe(): Observable<User> {
     return this.http.get<User>(`${this.apiUrl}/me`).pipe(
       tap(user => {
-        localStorage.setItem(this.USER_KEY, JSON.stringify(user));
+        this.getSessionStorage().setItem(this.USER_KEY, JSON.stringify(user));
         this.currentUser.set(user);
       })
     );
@@ -82,7 +93,7 @@ export class AuthService {
   updateProfile(payload: UserUpdateProfile): Observable<User> {
     return this.http.put<User>(`${this.apiUrl}/profile`, payload).pipe(
       tap(user => {
-        localStorage.setItem(this.USER_KEY, JSON.stringify(user));
+        this.getSessionStorage().setItem(this.USER_KEY, JSON.stringify(user));
         this.currentUser.set(user);
       })
     );
@@ -98,5 +109,8 @@ export class AuthService {
     if (current.role === 'admin') return true; // Admin has super-access
     return current.role === role;
   }
-}
 
+  private getSessionStorage(): Storage {
+    return localStorage.getItem(this.TOKEN_KEY) ? localStorage : sessionStorage;
+  }
+}

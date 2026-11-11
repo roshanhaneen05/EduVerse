@@ -9,6 +9,7 @@ import {
   PlatformStats
 } from '../models/admin.model';
 import { User } from '../models/user.model';
+import { AdminAnalyticsDashboard } from '../models/admin-analytics.model';
 
 @Injectable({
   providedIn: 'root'
@@ -20,6 +21,28 @@ export class AdminService {
 
   getStats(): Observable<PlatformStats> {
     return this.http.get<PlatformStats>(`${this.apiUrl}/stats`);
+  }
+
+  getAnalyticsDashboard(startDate: string, endDate: string): Observable<AdminAnalyticsDashboard> {
+    const params = new HttpParams()
+      .set('start_date', startDate)
+      .set('end_date', endDate);
+    return this.http.get<AdminAnalyticsDashboard>(`${this.apiUrl}/analytics/dashboard`, { params });
+  }
+
+  exportAnalytics(
+    format: 'csv' | 'pdf',
+    startDate: string,
+    endDate: string
+  ): Observable<Blob> {
+    const params = new HttpParams()
+      .set('format', format)
+      .set('start_date', startDate)
+      .set('end_date', endDate);
+    return this.http.get(`${this.apiUrl}/analytics/export`, {
+      params,
+      responseType: 'blob'
+    });
   }
 
   getUsers(filters?: {

@@ -57,41 +57,6 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
           </p>
         </div>
 
-        <!-- Role Selector Tabs -->
-        <div class="card-role-track" role="tablist">
-          <button
-            type="button"
-            class="role-pill-btn"
-            [class.active]="selectedRole === 'student'"
-            (click)="selectRole('student')"
-            role="tab"
-            [attr.aria-selected]="selectedRole === 'student'"
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M22 10v6M2 10l10-5 10 5-10 5z"/>
-              <path d="M6 12v5c3 3 9 3 12 0v-5"/>
-            </svg>
-            <span>Student</span>
-          </button>
-
-          <button
-            type="button"
-            class="role-pill-btn"
-            [class.active]="selectedRole === 'instructor'"
-            (click)="selectRole('instructor')"
-            role="tab"
-            [attr.aria-selected]="selectedRole === 'instructor'"
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
-              <circle cx="9" cy="7" r="4"/>
-              <line x1="19" y1="8" x2="19" y2="14"/>
-              <line x1="22" y1="11" x2="16" y2="11"/>
-            </svg>
-            <span>Instructor</span>
-          </button>
-        </div>
-
         @if (errorMessage) {
           <div class="alert alert-danger">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -143,12 +108,12 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
               type="password"
               class="form-input"
               formControlName="password"
-              placeholder="Min. 8 chars, 1 uppercase, 1 digit, 1 symbol"
+              placeholder="At least 8 characters, including a letter and number"
               [class.input-error]="isFieldInvalid('password')"
             />
             @if (isFieldInvalid('password')) {
               <div class="form-error">
-                Password must be at least 8 characters with upper, lower, digit, and symbol.
+                Password must be at least 8 characters and contain a letter and a number.
               </div>
             }
           </div>
@@ -188,7 +153,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
           <span class="divider-caption">Already have an account?</span>
         </div>
 
-        <a routerLink="/login" [queryParams]="{ role: selectedRole }" class="signin-pill-btn">
+        <a [routerLink]="['/', selectedRole, 'login']" class="signin-pill-btn">
           Sign In
         </a>
       </div>
@@ -267,43 +232,6 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
       color: #64748b;
       font-size: 0.925rem;
       line-height: 1.5;
-    }
-
-    /* Role Tabs */
-    .card-role-track {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 4px;
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 6px;
-      margin-bottom: 1.5rem;
-    }
-    .role-pill-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.45rem;
-      padding: 0.6rem 0.5rem;
-      border-radius: 8px;
-      border: none;
-      background: transparent;
-      color: #475569;
-      font-size: 0.875rem;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-    .role-pill-btn:hover:not(.active) {
-      color: #0f172a;
-      background-color: #f1f5f9;
-    }
-    .role-pill-btn.active {
-      background: #4f46e5;
-      color: #ffffff;
-      font-weight: 600;
-      box-shadow: 0 2px 8px rgba(79, 70, 229, 0.28);
     }
 
     .btn-block {
@@ -401,21 +329,17 @@ export class RegisterComponent implements OnInit {
     this.registerForm = this.fb.group({
       full_name: ['', [Validators.required, Validators.minLength(2), Validators.maxLength(100)]],
       email: ['', [Validators.required, Validators.email]],
-      password: ['', [Validators.required, Validators.minLength(8)]],
+      password: [
+        '',
+        [Validators.required, Validators.minLength(8), Validators.pattern(/(?=.*[A-Za-z])(?=.*\d)/)]
+      ],
       confirm_password: ['', [Validators.required]]
     }, { validators: passwordMatchValidator });
   }
 
   ngOnInit(): void {
-    const roleParam = this.route.snapshot.queryParams['role'];
-    if (roleParam === 'instructor' || roleParam === 'student') {
-      this.selectedRole = roleParam;
-    }
-  }
-
-  selectRole(role: RegisterRole): void {
-    this.selectedRole = role;
-    this.errorMessage = '';
+    const role = this.route.snapshot.data['role'];
+    this.selectedRole = role === 'instructor' ? 'instructor' : 'student';
   }
 
   isFieldInvalid(field: string): boolean {
@@ -451,15 +375,29 @@ export class RegisterComponent implements OnInit {
           },
           error: () => {
             this.isLoading = false;
-            this.router.navigate(['/login'], { queryParams: { role: this.selectedRole } });
+            this.router.navigate([`/${this.selectedRole}/login`]);
           }
         });
       },
       error: (err) => {
         this.isLoading = false;
-        this.errorMessage = err.error?.detail || 'Registration failed. Please check your information.';
+        if (err.status === 0) {
+          this.errorMessage = 'Unable to connect to the EduVerse backend at http://127.0.0.1:8000. Start the backend in a separate terminal and try again.';
+          return;
+        }
+
+        const detail = err.error?.detail;
+        if (typeof detail === 'string') {
+          this.errorMessage = detail;
+        } else if (Array.isArray(detail)) {
+          this.errorMessage = detail
+            .map((item: { msg?: string }) => item.msg)
+            .filter((message: string | undefined): message is string => !!message)
+            .join(' ');
+        } else {
+          this.errorMessage = 'Registration failed. Please check your information and try again.';
+        }
       }
     });
   }
 }
-
