@@ -44,7 +44,23 @@ export class AuthService {
   }
 
   login(payload: { email: string; password: string }, rememberMe = true): Observable<AuthResponse> {
-    return this.http.post<AuthResponse>(`${this.apiUrl}/login`, {
+    return this.authenticate(`${this.apiUrl}/login`, payload, rememberMe);
+  }
+
+  instructorLogin(payload: { email: string; password: string }, rememberMe = true): Observable<AuthResponse> {
+    return this.authenticate(`${this.apiUrl}/instructor-login`, payload, rememberMe);
+  }
+
+  setInstructorPassword(payload: { token: string; new_password: string }): Observable<{ message: string }> {
+    return this.http.post<{ message: string }>(`${this.apiUrl}/instructor-password`, payload);
+  }
+
+  private authenticate(
+    endpoint: string,
+    payload: { email: string; password: string },
+    rememberMe: boolean
+  ): Observable<AuthResponse> {
+    return this.http.post<AuthResponse>(endpoint, {
       ...payload,
       remember_me: rememberMe
     }).pipe(

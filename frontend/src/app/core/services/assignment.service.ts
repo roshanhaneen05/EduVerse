@@ -4,6 +4,7 @@ import { Observable } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import {
   Assignment,
+  AssignmentAttachment,
   AssignmentSubmission,
   SubmissionCreatePayload,
 } from '../models/assignment.model';
@@ -26,6 +27,12 @@ export class AssignmentService {
 
   submitAssignment(assignmentId: number, payload: SubmissionCreatePayload): Observable<AssignmentSubmission> {
     return this.http.post<AssignmentSubmission>(`${this.apiUrl}/${assignmentId}/submit`, payload);
+  }
+
+  uploadAssignmentAttachment(assignmentId: number, file: File): Observable<AssignmentAttachment> {
+    const formData = new FormData();
+    formData.append('file', file);
+    return this.http.post<AssignmentAttachment>(`${this.apiUrl}/${assignmentId}/attachments`, formData);
   }
 
   getMySubmission(assignmentId: number): Observable<AssignmentSubmission | null> {

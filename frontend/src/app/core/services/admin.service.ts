@@ -10,6 +10,7 @@ import {
 } from '../models/admin.model';
 import { User } from '../models/user.model';
 import { AdminAnalyticsDashboard } from '../models/admin-analytics.model';
+import { InstructorPayload, InstructorProfile } from '../models/instructor.model';
 
 @Injectable({
   providedIn: 'root'
@@ -94,5 +95,50 @@ export class AdminService {
 
   toggleCoursePublish(courseId: number): Observable<AdminCourseItem> {
     return this.http.patch<AdminCourseItem>(`${this.apiUrl}/courses/${courseId}/publish`, {});
+  }
+
+  getInstructors(filters?: {
+    search?: string;
+    department?: string;
+    is_active?: boolean;
+  }): Observable<InstructorProfile[]> {
+    let params = new HttpParams();
+    if (filters?.search) params = params.set('search', filters.search);
+    if (filters?.department) params = params.set('department', filters.department);
+    if (filters?.is_active !== undefined) params = params.set('is_active', filters.is_active.toString());
+    return this.http.get<InstructorProfile[]>(`${this.apiUrl}/instructors`, { params });
+  }
+
+  createInstructor(payload: InstructorPayload): Observable<InstructorProfile> {
+    return this.http.post<InstructorProfile>(`${this.apiUrl}/instructors`, payload);
+  }
+
+  updateInstructor(userId: number, payload: Partial<InstructorPayload>): Observable<InstructorProfile> {
+    return this.http.put<InstructorProfile>(`${this.apiUrl}/instructors/${userId}`, payload);
+  }
+
+  updateInstructorStatus(userId: number, is_active: boolean): Observable<InstructorProfile> {
+    return this.http.patch<InstructorProfile>(
+      `${this.apiUrl}/instructors/${userId}/status`,
+      { is_active }
+    );
+  }
+
+  resetInstructorPassword(userId: number): Observable<{ message: string }> {
+    return this.http.post<{ message: string }>(
+      `${this.apiUrl}/instructors/${userId}/password-reset`,
+      {}
+    );
+  }
+
+  deleteInstructor(userId: number): Observable<{ message: string }> {
+    return this.http.delete<{ message: string }>(`${this.apiUrl}/instructors/${userId}`);
+  }
+
+  assignCourse(courseId: number, instructorUserId: number): Observable<{ message: string }> {
+    return this.http.put<{ message: string }>(
+      `${this.apiUrl}/courses/${courseId}/instructor`,
+      { instructor_user_id: instructorUserId }
+    );
   }
 }

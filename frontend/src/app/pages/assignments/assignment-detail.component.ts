@@ -3,7 +3,7 @@ import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import { AssignmentService } from '../../core/services/assignment.service';
-import { Assignment, AssignmentSubmission } from '../../core/models/assignment.model';
+import { Assignment, AssignmentAttachment, AssignmentSubmission } from '../../core/models/assignment.model';
 
 @Component({
   selector: 'app-assignment-detail',
@@ -126,6 +126,9 @@ import { Assignment, AssignmentSubmission } from '../../core/models/assignment.m
                     <div class="submitted-text-display">
                       {{ mySubmission.submission_text }}
                     </div>
+                    @for (attachment of submissionAttachments; track attachment.storage_key) {
+                      <div class="attachment-chip">📎 {{ attachment.name }}</div>
+                    }
 
                     @if (assignment.allow_resubmission && !assignment.is_closed) {
                       <div class="submission-actions">
@@ -165,9 +168,29 @@ import { Assignment, AssignmentSubmission } from '../../core/models/assignment.m
                         }
                       </div>
 
+                      <div class="form-group">
+                        <label class="form-label" for="assignment_attachment">Attach a document (PDF, DOCX, or TXT; up to 10 MB)</label>
+                        <input
+                          id="assignment_attachment"
+                          type="file"
+                          accept=".pdf,.docx,.txt"
+                          (change)="uploadAttachment($event)"
+                          [disabled]="isUploadingAttachment"
+                        />
+                        @if (isUploadingAttachment) {
+                          <small>Uploading document…</small>
+                        }
+                        @for (attachment of attachments; track attachment.storage_key) {
+                          <div class="attachment-chip">
+                            📎 {{ attachment.name }}
+                            <button type="button" class="btn btn-sm btn-secondary" (click)="removeAttachment(attachment)">Remove</button>
+                          </div>
+                        }
+                      </div>
+
                       <div class="file-storage-note">
                         <span class="storage-icon">ℹ️</span>
-                        <span>Written responses & markdown formatting supported. Cloud file uploads will be available in an upcoming release.</span>
+                        <span>Written responses and PDF, DOCX, or TXT documents are supported. Documents are stored privately and are only used for instructor review.</span>
                       </div>
 
                       <div class="form-actions">
@@ -405,6 +428,17 @@ import { Assignment, AssignmentSubmission } from '../../core/models/assignment.m
       margin-bottom: 1.25rem;
       line-height: 1.4;
     }
+    .attachment-chip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .6rem .8rem;
+      margin: .4rem 0;
+      border: 1px solid var(--border-light);
+      border-radius: var(--radius-md);
+      background: #fff;
+    }
     .storage-icon {
       font-size: 1rem;
     }
@@ -448,6 +482,8 @@ export class AssignmentDetailComponent implements OnInit {
   isEditingSubmission = false;
   feedbackMessage = '';
   isError = false;
+  attachments: AssignmentAttachment[] = [];
+  isUploadingAttachment = false;
 
   constructor(
     private assignmentService: AssignmentService,
@@ -481,6 +517,7 @@ export class AssignmentDetailComponent implements OnInit {
     this.assignmentService.getMySubmission(id).subscribe({
       next: (sub) => {
         this.mySubmission = sub;
+        this.attachments = this.parseAttachments(sub?.attachments_json);
         this.isLoading = false;
       },
       error: () => {
@@ -494,6 +531,7 @@ export class AssignmentDetailComponent implements OnInit {
       this.submissionForm.patchValue({
         submission_text: this.mySubmission.submission_text
       });
+      this.attachments = this.parseAttachments(this.mySubmission.attachments_json);
     }
     this.isEditingSubmission = true;
   }
@@ -505,7 +543,10 @@ export class AssignmentDetailComponent implements OnInit {
     this.feedbackMessage = '';
     this.isError = false;
 
-    this.assignmentService.submitAssignment(this.assignment.id, this.submissionForm.value).subscribe({
+    this.assignmentService.submitAssignment(this.assignment.id, {
+      ...this.submissionForm.value,
+      attachments_json: this.attachments.length ? JSON.stringify(this.attachments) : null,
+    }).subscribe({
       next: (sub) => {
         this.isSubmitting = false;
         this.mySubmission = sub;
@@ -518,6 +559,58 @@ export class AssignmentDetailComponent implements OnInit {
         this.feedbackMessage = err.error?.detail || 'Failed to submit work.';
       }
     });
+  }
+
+  uploadAttachment(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file || !this.assignment) return;
+    if (!/\.(pdf|docx|txt)$/i.test(file.name)) {
+      this.feedbackMessage = 'Choose a PDF, DOCX, or TXT file.';
+      this.isError = true;
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      this.feedbackMessage = 'Assignment documents must be 10 MB or smaller.';
+      this.isError = true;
+      return;
+    }
+    this.isUploadingAttachment = true;
+    this.assignmentService.uploadAssignmentAttachment(this.assignment.id, file).subscribe({
+      next: (attachment) => {
+        this.attachments = [...this.attachments, attachment];
+        this.isUploadingAttachment = false;
+        this.feedbackMessage = `${attachment.name} uploaded. Submit the assignment to attach it.`;
+        this.isError = false;
+      },
+      error: (error) => {
+        this.isUploadingAttachment = false;
+        this.feedbackMessage = error.error?.detail || 'Could not upload this attachment.';
+        this.isError = true;
+      },
+    });
+  }
+
+  removeAttachment(attachment: AssignmentAttachment): void {
+    this.attachments = this.attachments.filter((item) => item.storage_key !== attachment.storage_key);
+  }
+
+  get submissionAttachments(): AssignmentAttachment[] {
+    return this.parseAttachments(this.mySubmission?.attachments_json);
+  }
+
+  private parseAttachments(value?: string | null): AssignmentAttachment[] {
+    if (!value) return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed)
+        ? parsed.filter((item): item is AssignmentAttachment =>
+            !!item && typeof item.name === 'string' && typeof item.storage_key === 'string')
+        : [];
+    } catch {
+      return [];
+    }
   }
 
   isPastDue(): boolean {

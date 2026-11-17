@@ -21,8 +21,9 @@ export const routes: Routes = [
   },
   {
     path: 'instructor/login',
-    redirectTo: 'login',
-    pathMatch: 'full'
+    loadComponent: () => import('./pages/login/login.component').then(m => m.LoginComponent),
+    data: { role: 'instructor' },
+    title: 'Instructor Sign In - EduVerse'
   },
   {
     path: 'admin/login',
@@ -43,9 +44,13 @@ export const routes: Routes = [
   },
   {
     path: 'instructor/register',
-    loadComponent: () => import('./pages/register/register.component').then(m => m.RegisterComponent),
-    data: { role: 'instructor' },
-    title: 'Instructor Registration - EduVerse'
+    redirectTo: 'register',
+    pathMatch: 'full'
+  },
+  {
+    path: 'instructor/setup-password',
+    loadComponent: () => import('./pages/instructor/instructor-password-setup.component').then(m => m.InstructorPasswordSetupComponent),
+    title: 'Set Instructor Password - EduVerse'
   },
   {
     path: 'courses',
@@ -132,6 +137,20 @@ export const routes: Routes = [
     title: 'Assessment History - EduVerse'
   },
   {
+    path: 'student/ai-quiz',
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['student'] },
+    loadComponent: () => import('./pages/student/ai-quiz-generator.component').then(m => m.AIQuizGeneratorComponent),
+    title: 'AI Quiz Generator - EduVerse'
+  },
+  {
+    path: 'student/study-planner',
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['student'] },
+    loadComponent: () => import('./pages/student/ai-study-planner.component').then(m => m.AIStudyPlannerComponent),
+    title: 'AI Smart Study Planner - EduVerse'
+  },
+  {
     path: 'profile',
     canActivate: [authGuard],
     loadComponent: () => import('./pages/profile/profile.component').then(m => m.ProfileComponent),
@@ -150,6 +169,20 @@ export const routes: Routes = [
     data: { roles: ['instructor', 'admin'] },
     loadComponent: () => import('./pages/instructor/instructor-dashboard.component').then(m => m.InstructorDashboardComponent),
     title: 'Instructor Hub - EduVerse'
+  },
+  {
+    path: 'instructor/ai-assignment-evaluator',
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['instructor', 'admin'] },
+    loadComponent: () => import('./pages/instructor/ai-assignment-evaluator.component').then(m => m.AIAssignmentEvaluatorComponent),
+    title: 'AI Assignment Evaluator - EduVerse'
+  },
+  {
+    path: 'instructor/ai-question-paper-generator',
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['instructor', 'admin'] },
+    loadComponent: () => import('./pages/instructor/ai-question-paper-generator.component').then(m => m.AIQuestionPaperGeneratorComponent),
+    title: 'AI Question Paper Generator - EduVerse'
   },
   {
     path: 'instructor/courses/new',
@@ -222,6 +255,13 @@ export const routes: Routes = [
     data: { roles: ['admin'] },
     loadComponent: () => import('./pages/admin/user-management.component').then(m => m.UserManagementComponent),
     title: 'User Governance - EduVerse'
+  },
+  {
+    path: 'admin/instructors',
+    canActivate: [authGuard, roleGuard],
+    data: { roles: ['admin'] },
+    loadComponent: () => import('./pages/admin/instructor-management.component').then(m => m.InstructorManagementComponent),
+    title: 'Instructor Management - EduVerse'
   },
   {
     path: 'admin/courses',

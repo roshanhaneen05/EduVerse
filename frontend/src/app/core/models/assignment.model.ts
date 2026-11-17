@@ -56,6 +56,13 @@ export interface AssignmentSubmission {
   max_marks?: number | null;
 }
 
+export interface AssignmentAttachment {
+  name: string;
+  storage_key: string;
+  mime_type: string;
+  file_size: number;
+}
+
 export interface AssignmentCreatePayload {
   title: string;
   description?: string;

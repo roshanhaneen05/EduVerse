@@ -26,7 +26,7 @@ type AccountRole = 'student' | 'instructor' | 'admin';
         <div class="selection-heading">
           <span class="eyebrow">WELCOME TO EDUVERSE</span>
           <h1>{{ isRegisterMode ? 'Choose your account type' : 'How will you use EduVerse?' }}</h1>
-          <p>{{ isRegisterMode ? 'Choose Student or Instructor to create your EduVerse account.' : 'Choose your account type to continue to your secure sign in.' }}</p>
+          <p>{{ isRegisterMode ? 'Student accounts are open for registration. Instructor accounts are created by an administrator.' : 'Choose your account type to continue to your secure sign in.' }}</p>
         </div>
 
         <div class="account-grid" [class.registration-grid]="isRegisterMode">
@@ -240,7 +240,7 @@ export class AccountSelectionComponent {
       label: 'TEACH & INSPIRE',
       title: 'Instructor',
       description: 'Manage courses, create lessons and monitor student progress.',
-      registerDescription: 'Create an instructor account to share your expertise and manage courses.',
+      registerDescription: 'Instructor accounts are created by an EduVerse administrator.',
       button: 'Instructor Login'
     },
     {
@@ -254,7 +254,7 @@ export class AccountSelectionComponent {
   ];
 
   get visibleAccounts() {
-    return this.isRegisterMode ? this.accounts.filter(account => account.role !== 'admin') : this.accounts;
+    return this.isRegisterMode ? this.accounts.filter(account => account.role === 'student') : this.accounts;
   }
 
   constructor(private route: ActivatedRoute) {

@@ -18,6 +18,7 @@ import { AuthService } from '../../core/services/auth.service';
           <a routerLink="/student/my-learning" class="nav-pill">My Learning</a>
           <a routerLink="/student/assignments" class="nav-pill">Assignments & Tasks</a>
           <a routerLink="/student/quiz-history" class="nav-pill">Assessment History</a>
+          <a routerLink="/student/ai-quiz" class="nav-pill">AI Learning Tools</a>
         </div>
 
         <!-- Dashboard Welcome Banner -->
@@ -86,6 +87,27 @@ import { AuthService } from '../../core/services/auth.service';
               </div>
             </div>
           </div>
+
+          <section class="ai-tools-section card">
+            <div class="section-header">
+              <div>
+                <h2>AI Learning Tools</h2>
+                <p class="section-sub">Practice with your course lessons and build a study plan around your progress.</p>
+              </div>
+            </div>
+            <div class="ai-tools-grid">
+              <a routerLink="/student/ai-quiz" class="ai-tool-link">
+                <span class="ai-tool-icon">✦</span>
+                <span><strong>AI Quiz Generator</strong><small>Generate lesson-grounded quizzes and review your results.</small></span>
+                <span class="ai-tool-arrow">→</span>
+              </a>
+              <a routerLink="/student/study-planner" class="ai-tool-link">
+                <span class="ai-tool-icon">◷</span>
+                <span><strong>AI Smart Study Planner</strong><small>Turn your actual course progress into a weekly timetable.</small></span>
+                <span class="ai-tool-arrow">→</span>
+              </a>
+            </div>
+          </section>
 
           <!-- Highlighted Continue Learning Hero Card (If Active Course Exists) -->
           @if (activeCourseToContinue) {
@@ -610,6 +632,55 @@ import { AuthService } from '../../core/services/auth.service';
     .section-block {
       margin-top: 2rem;
     }
+    .ai-tools-section {
+      margin: 1.5rem 0 2rem;
+      border: 1px solid #f3c9df;
+      background: linear-gradient(135deg, #fff 0%, #fff8fc 100%);
+    }
+    .ai-tools-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .ai-tool-link {
+      display: flex;
+      align-items: center;
+      gap: .9rem;
+      padding: 1rem;
+      border: 1px solid #f3d4e4;
+      border-radius: var(--radius-md);
+      background: #fff;
+      color: var(--text-primary);
+      text-decoration: none;
+      transition: transform .18s ease, box-shadow .18s ease;
+    }
+    .ai-tool-link:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(190, 24, 93, .1);
+    }
+    .ai-tool-link > span:nth-child(2) {
+      display: grid;
+      gap: .25rem;
+      flex: 1;
+    }
+    .ai-tool-link small {
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+    .ai-tool-icon {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      flex: 0 0 42px;
+      border-radius: 12px;
+      background: #fff0f7;
+      color: #be185d;
+      font-size: 1.3rem;
+      font-weight: 800;
+    }
+    .ai-tool-arrow { color: #be185d; font-size: 1.2rem; }
     .section-header {
       display: flex;
       justify-content: space-between;

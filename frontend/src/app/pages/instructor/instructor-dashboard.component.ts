@@ -5,6 +5,7 @@ import { InstructorService } from '../../core/services/instructor.service';
 import { EnhancedInstructorDashboardStats } from '../../core/models/analytics.model';
 import { Course } from '../../core/models/course.model';
 import { InstructorEnrollment } from '../../core/models/enrollment.model';
+import { InstructorProfile } from '../../core/models/instructor.model';
 
 @Component({
   selector: 'app-instructor-dashboard',
@@ -16,13 +17,41 @@ import { InstructorEnrollment } from '../../core/models/enrollment.model';
         <!-- Header -->
         <div class="page-header">
           <div>
-            <h1>Instructor Faculty Hub</h1>
+            <h1>{{ profile ? 'Welcome, ' + profile.full_name : 'Instructor Faculty Hub' }}</h1>
             <p class="subtitle">Design courses, author curriculum lessons, configure assessments, and inspect learner progress.</p>
+            @if (profile) {
+              <div class="profile-summary card">
+                <span class="profile-avatar">{{ profile.instructor_id.slice(-2) }}</span>
+                <span><strong>{{ profile.instructor_id }}</strong><small>{{ profile.department || 'Instructor' }} · {{ profile.qualification || 'Faculty profile' }}</small></span>
+                <a routerLink="/profile" class="btn btn-sm btn-outline">Profile Settings</a>
+              </div>
+            }
           </div>
           <a routerLink="/instructor/courses/new" class="btn btn-primary btn-lg">
             + Create New Course
           </a>
         </div>
+
+        <section class="section-block teaching-tools">
+          <div class="section-header">
+            <div>
+              <h2>AI Teaching Tools</h2>
+              <p class="subtitle">Instructor-reviewed tools for grading and assessment authoring.</p>
+            </div>
+          </div>
+          <div class="teaching-tool-grid">
+            <a routerLink="/instructor/ai-assignment-evaluator" class="teaching-tool-card card">
+              <span class="tool-icon">✦</span>
+              <span><strong>AI Assignment Evaluator</strong><small>Review rubric-based feedback and approve grades before students see them.</small></span>
+              <span class="tool-arrow">→</span>
+            </a>
+            <a routerLink="/instructor/ai-question-paper-generator" class="teaching-tool-card card">
+              <span class="tool-icon">📝</span>
+              <span><strong>AI Question Paper Generator</strong><small>Generate lesson-grounded draft papers, edit questions, and export PDFs.</small></span>
+              <span class="tool-arrow">→</span>
+            </a>
+          </div>
+        </section>
 
         @if (isLoading) {
           <div class="loading-state">
@@ -307,6 +336,28 @@ import { InstructorEnrollment } from '../../core/models/enrollment.model';
       margin-top: 0.35rem;
       font-size: 1.05rem;
     }
+    .profile-summary {
+      display: inline-flex;
+      align-items: center;
+      gap: .75rem;
+      margin-top: .9rem;
+      padding: .6rem .8rem;
+      border: 1px solid #f1c8da;
+      background: #fffafd;
+    }
+    .profile-summary > span:nth-child(2) { display: flex; flex-direction: column; gap: .15rem; }
+    .profile-summary small { color: var(--text-muted); }
+    .profile-avatar {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: linear-gradient(135deg, #e83e8c, #9d5bd2);
+      font-size: .75rem;
+      font-weight: 800;
+    }
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -362,6 +413,32 @@ import { InstructorEnrollment } from '../../core/models/enrollment.model';
     .section-block {
       margin-bottom: 2.5rem;
     }
+    .teaching-tool-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+      gap: 1rem;
+    }
+    .teaching-tool-card {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 1.15rem;
+      text-decoration: none;
+      color: var(--text-primary);
+      border-color: #f0d7e7;
+      transition: transform .18s ease, box-shadow .18s ease;
+    }
+    .teaching-tool-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 12px 28px rgba(190, 36, 119, .12);
+    }
+    .teaching-tool-card strong, .teaching-tool-card small { display:block; }
+    .teaching-tool-card small { margin-top:.3rem; color:var(--text-muted); line-height:1.45; }
+    .tool-icon {
+      width:42px;height:42px;display:grid;place-items:center;flex:none;border-radius:12px;
+      color:#a51b66;background:#fff0f7;font-size:1.25rem;
+    }
+    .tool-arrow { margin-left:auto;color:#bd2777;font-size:1.25rem;font-weight:800; }
     .section-header {
       display: flex;
       justify-content: space-between;
@@ -465,6 +542,7 @@ import { InstructorEnrollment } from '../../core/models/enrollment.model';
 })
 export class InstructorDashboardComponent implements OnInit {
   stats: EnhancedInstructorDashboardStats | null = null;
+  profile: InstructorProfile | null = null;
   myCourses: Course[] = [];
   enrollments: InstructorEnrollment[] = [];
   enrollmentRequests: InstructorEnrollment[] = [];
@@ -477,6 +555,10 @@ export class InstructorDashboardComponent implements OnInit {
   constructor(private instructorService: InstructorService) {}
 
   ngOnInit(): void {
+    this.instructorService.getProfile().subscribe({
+      next: profile => this.profile = profile,
+      error: () => this.profile = null
+    });
     this.fetchData();
   }
 

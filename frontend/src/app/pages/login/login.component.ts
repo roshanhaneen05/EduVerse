@@ -1,7 +1,7 @@
 import { Component } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormsModule, FormBuilder, FormGroup, Validators } from '@angular/forms';
-import { Router, RouterLink } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { AuthService } from '../../core/services/auth.service';
 
 @Component({
@@ -141,8 +141,10 @@ import { AuthService } from '../../core/services/auth.service';
                 </div>
                 <span class="card-brand-title">EduVerse</span>
               </div>
-              <h2 class="card-welcome-title">Welcome back</h2>
-              <p class="card-welcome-sub">Sign in to your EduVerse account</p>
+              <h2 class="card-welcome-title">{{ instructorLogin ? 'Instructor sign in' : 'Welcome back' }}</h2>
+              <p class="card-welcome-sub">
+                {{ instructorLogin ? 'Sign in with your registered instructor account' : 'Sign in to your EduVerse account' }}
+              </p>
             </div>
 
             <!-- Error or Info Alert -->
@@ -860,12 +862,15 @@ export class LoginComponent {
   isLoading = false;
   errorMessage = '';
   infoNotice = '';
+  instructorLogin = false;
 
   constructor(
     private fb: FormBuilder,
     private auth: AuthService,
-    private router: Router
+    private router: Router,
+    private route: ActivatedRoute
   ) {
+    this.instructorLogin = this.route.snapshot.data['role'] === 'instructor';
     this.loginForm = this.fb.group({
       email: ['', [Validators.required, Validators.email]],
       password: ['', [Validators.required]]
@@ -894,7 +899,10 @@ export class LoginComponent {
       password: this.loginForm.value.password
     };
 
-    this.auth.login(credentials, this.rememberMe).subscribe({
+    const login = this.instructorLogin
+      ? this.auth.instructorLogin(credentials, this.rememberMe)
+      : this.auth.login(credentials, this.rememberMe);
+    login.subscribe({
       next: (res) => {
         this.isLoading = false;
         const dashboardByRole = {

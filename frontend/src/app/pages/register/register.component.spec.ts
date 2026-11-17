@@ -42,4 +42,17 @@ describe('RegisterComponent', () => {
 
     expect(component.errorMessage).toBe('An account with this email address already exists.');
   });
+
+  it('explains that instructor accounts require administrator registration', () => {
+    auth.register.and.returnValue(
+      throwError(() => ({
+        status: 403,
+        error: { detail: 'Instructor accounts must be created by an administrator.' }
+      }))
+    );
+
+    component.onSubmit();
+
+    expect(component.errorMessage).toBe('Instructor accounts must be created by an administrator.');
+  });
 });

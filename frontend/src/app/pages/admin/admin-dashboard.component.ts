@@ -28,6 +28,9 @@ import { PlatformStats } from '../../core/models/admin.model';
             <a routerLink="/admin/users" class="btn btn-secondary">
               User Directory →
             </a>
+            <a routerLink="/admin/instructors" class="btn btn-primary">
+              Instructor Management →
+            </a>
             <a routerLink="/admin/courses" class="btn btn-primary">
               Course Management →
             </a>
@@ -166,6 +169,16 @@ import { PlatformStats } from '../../core/models/admin.model';
               </div>
               <a routerLink="/admin/users" class="btn btn-primary">
                 Open User Directory →
+              </a>
+            </div>
+
+            <div class="action-banner card">
+              <div class="banner-text">
+                <h3>Instructor Management</h3>
+                <p>Register faculty, maintain instructor accounts, and assign courses.</p>
+              </div>
+              <a routerLink="/admin/instructors" class="btn btn-primary">
+                Manage Instructors →
               </a>
             </div>
 

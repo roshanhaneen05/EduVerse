@@ -14,6 +14,17 @@ import { LessonCreatePayload, Lesson, LessonUpdatePayload } from '../models/less
 import { Quiz, QuizCreatePayload, QuizUpdatePayload } from '../models/quiz.model';
 import { Assignment, AssignmentCreatePayload, AssignmentSubmission, AssignmentUpdatePayload, SubmissionGradePayload } from '../models/assignment.model';
 import { EnrollmentDecision, InstructorEnrollment } from '../models/enrollment.model';
+import { InstructorProfile } from '../models/instructor.model';
+import {
+  AssignmentEvaluation,
+  AssignmentRubric,
+  InstructorPaperOutline,
+  InstructorQuestionPaper,
+  InstructorQuestionPaperSummary,
+  InstructorTeachingCourse,
+  InstructorTeachingSubmission,
+  QuestionPaperGeneratePayload,
+} from '../models/instructor-ai.model';
 
 @Injectable({
   providedIn: 'root'
@@ -25,6 +36,10 @@ export class InstructorService {
 
   getDashboard(): Observable<EnhancedInstructorDashboardStats> {
     return this.http.get<EnhancedInstructorDashboardStats>(`${this.apiUrl}/dashboard`);
+  }
+
+  getProfile(): Observable<InstructorProfile> {
+    return this.http.get<InstructorProfile>(`${this.apiUrl}/profile`);
   }
 
   getStudentEnrollments(): Observable<InstructorEnrollment[]> {
@@ -199,5 +214,131 @@ export class InstructorService {
 
   gradeSubmission(submissionId: number, payload: SubmissionGradePayload): Observable<AssignmentSubmission> {
     return this.http.put<AssignmentSubmission>(`${this.apiUrl}/submissions/${submissionId}/grade`, payload);
+  }
+
+  getTeachingCourses(): Observable<InstructorTeachingCourse[]> {
+    return this.http.get<InstructorTeachingCourse[]>(`${this.apiUrl}/teaching/courses`);
+  }
+
+  getTeachingCourseOutline(courseId: number): Observable<InstructorPaperOutline> {
+    return this.http.get<InstructorPaperOutline>(`${this.apiUrl}/teaching/courses/${courseId}/outline`);
+  }
+
+  getTeachingSubmissions(filters: {
+    course_id?: number;
+    assignment_id?: number;
+    student_id?: number;
+    submission_status?: string;
+  } = {}): Observable<InstructorTeachingSubmission[]> {
+    let params = new HttpParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        params = params.set(key, String(value));
+      }
+    });
+    return this.http.get<InstructorTeachingSubmission[]>(`${this.apiUrl}/teaching/submissions`, { params });
+  }
+
+  getAssignmentRubric(assignmentId: number): Observable<AssignmentRubric> {
+    return this.http.get<AssignmentRubric>(`${this.apiUrl}/teaching/assignments/${assignmentId}/rubric`);
+  }
+
+  saveAssignmentRubric(assignmentId: number, rubric: Pick<AssignmentRubric, 'expected_answer' | 'criteria'>): Observable<AssignmentRubric> {
+    return this.http.put<AssignmentRubric>(`${this.apiUrl}/teaching/assignments/${assignmentId}/rubric`, rubric);
+  }
+
+  evaluateAssignmentSubmission(submissionId: number, force = false): Observable<AssignmentEvaluation> {
+    return this.http.post<AssignmentEvaluation>(
+      `${this.apiUrl}/teaching/submissions/${submissionId}/evaluate`,
+      {},
+      { params: new HttpParams().set('force', String(force)) }
+    );
+  }
+
+  getSubmissionEvaluations(submissionId: number): Observable<AssignmentEvaluation[]> {
+    return this.http.get<AssignmentEvaluation[]>(`${this.apiUrl}/teaching/submissions/${submissionId}/evaluations`);
+  }
+
+  downloadSubmissionAttachment(submissionId: number, attachmentIndex: number): Observable<Blob> {
+    return this.http.get(
+      `${this.apiUrl}/teaching/submissions/${submissionId}/attachments/${attachmentIndex}`,
+      { responseType: 'blob' }
+    );
+  }
+
+  saveEvaluationReview(evaluationId: number, payload: {
+    final_marks: number;
+    instructor_feedback: string;
+    criteria: Array<{
+      id: number;
+      criterion_name: string;
+      maximum_marks: number;
+      final_marks: number;
+      feedback: string;
+    }>;
+  }): Observable<AssignmentEvaluation> {
+    return this.http.put<AssignmentEvaluation>(`${this.apiUrl}/teaching/evaluations/${evaluationId}`, payload);
+  }
+
+  approveEvaluation(evaluationId: number): Observable<AssignmentEvaluation> {
+    return this.http.post<AssignmentEvaluation>(
+      `${this.apiUrl}/teaching/evaluations/${evaluationId}/approve`,
+      {}
+    );
+  }
+
+  reevaluateSubmission(evaluationId: number): Observable<AssignmentEvaluation> {
+    return this.http.post<AssignmentEvaluation>(
+      `${this.apiUrl}/teaching/evaluations/${evaluationId}/reevaluate`,
+      {}
+    );
+  }
+
+  getQuestionPapers(): Observable<InstructorQuestionPaperSummary[]> {
+    return this.http.get<InstructorQuestionPaperSummary[]>(`${this.apiUrl}/teaching/question-papers`);
+  }
+
+  generateQuestionPaper(payload: QuestionPaperGeneratePayload): Observable<InstructorQuestionPaper> {
+    return this.http.post<InstructorQuestionPaper>(`${this.apiUrl}/teaching/question-papers/generate`, payload);
+  }
+
+  getQuestionPaper(paperId: number): Observable<InstructorQuestionPaper> {
+    return this.http.get<InstructorQuestionPaper>(`${this.apiUrl}/teaching/question-papers/${paperId}`);
+  }
+
+  saveQuestionPaper(paperId: number, payload: {
+    title: string;
+    total_marks: number;
+    duration_minutes: number;
+    difficulty: InstructorQuestionPaper['difficulty'];
+    exam_date?: string | null;
+    questions: InstructorQuestionPaper['questions'];
+  }): Observable<InstructorQuestionPaper> {
+    return this.http.put<InstructorQuestionPaper>(`${this.apiUrl}/teaching/question-papers/${paperId}`, payload);
+  }
+
+  publishQuestionPaper(paperId: number): Observable<InstructorQuestionPaper> {
+    return this.http.post<InstructorQuestionPaper>(
+      `${this.apiUrl}/teaching/question-papers/${paperId}/publish`,
+      {}
+    );
+  }
+
+  deleteQuestionPaper(paperId: number): Observable<void> {
+    return this.http.delete<void>(`${this.apiUrl}/teaching/question-papers/${paperId}`);
+  }
+
+  regeneratePaperQuestion(paperId: number, questionId: number): Observable<InstructorQuestionPaper> {
+    return this.http.post<InstructorQuestionPaper>(
+      `${this.apiUrl}/teaching/question-papers/${paperId}/questions/${questionId}/regenerate`,
+      {}
+    );
+  }
+
+  exportQuestionPaperPdf(paperId: number, answerKey = false): Observable<Blob> {
+    const suffix = answerKey ? 'answer-key.pdf' : 'pdf';
+    return this.http.get(`${this.apiUrl}/teaching/question-papers/${paperId}/${suffix}`, {
+      responseType: 'blob',
+    });
   }
 }
