@@ -67,6 +67,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("DEFAULT_FROM_EMAIL", "SMTP_FROM_EMAIL"),
     )
     EMAIL_TIMEOUT_SECONDS: int = 10
+    FRONTEND_BASE_URL: str = "http://localhost:4200"
 
     # Server
     HOST: str = "127.0.0.1"
@@ -74,7 +75,11 @@ class Settings(BaseSettings):
     RELOAD: bool = True
 
     # AI Integration
-    AI_PROVIDER: str = "local_fallback"
+    AI_PROVIDER: str = "gemini"
+    AI_API_KEY: str = ""
+    AI_MODEL: str = "gemini-3.8-flash"
+    AI_API_BASE_URL: str = "https://api.openai.com/v1"
+    AI_TIMEOUT_SECONDS: int = 45
 
     @property
     def cors_origins_list(self) -> List[str]:

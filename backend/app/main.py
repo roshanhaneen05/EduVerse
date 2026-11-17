@@ -16,11 +16,14 @@ from app.routers import (
     enrollments_router,
     health_router,
     instructor_router,
+    instructor_admin_router,
+    instructor_teaching_router,
     lessons_router,
     materials_router,
     notifications_router,
     quizzes_router,
     student_router,
+    student_ai_learning_router,
 )
 
 settings = get_settings()
@@ -100,10 +103,13 @@ app.include_router(quizzes_router, prefix=api_v1_prefix)
 app.include_router(assignments_router, prefix=api_v1_prefix)
 app.include_router(materials_router, prefix=api_v1_prefix)
 app.include_router(student_router, prefix=api_v1_prefix)
+app.include_router(student_ai_learning_router, prefix=api_v1_prefix)
 app.include_router(announcements_router, prefix=api_v1_prefix)
 app.include_router(discussions_router, prefix=api_v1_prefix)
 app.include_router(notifications_router, prefix=api_v1_prefix)
 app.include_router(instructor_router, prefix=api_v1_prefix)
+app.include_router(instructor_admin_router, prefix=api_v1_prefix)
+app.include_router(instructor_teaching_router, prefix=api_v1_prefix)
 app.include_router(admin_router, prefix=api_v1_prefix)
 app.include_router(ai_router, prefix=api_v1_prefix)
 

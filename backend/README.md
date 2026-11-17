@@ -1,6 +1,6 @@
 # EduVerse — Backend Service
 
-The EduVerse backend is a modular monolith built with **Python 3.13**, **FastAPI**, **SQLAlchemy ORM 2.x**, **Pydantic v2**, and **Alembic**.
+The EduVerse backend is a modular monolith built with **Python 3.10+**, **FastAPI**, **SQLAlchemy ORM 2.x**, **Pydantic v2**, and **Alembic**.
 
 ---
 
@@ -73,7 +73,7 @@ Migrations are managed with Alembic using `render_as_batch=True` to support SQLi
 cd C:\EduVerse\backend
 .\.venv\Scripts\alembic.exe current
 ```
-*Expected output*: `fb4ef543d5d3 (head)`
+*Expected output*: `7b2c4e6a9d10 (head)` after applying all migrations.
 
 ### Generate New Revision
 ```powershell
@@ -84,6 +84,25 @@ cd C:\EduVerse\backend
 ```powershell
 .\.venv\Scripts\alembic.exe upgrade head
 ```
+
+The instructor-management migration adds one-to-one instructor profiles and expiring, single-use password setup tokens. It backfills existing instructor accounts so their course ownership and access remain intact. Public instructor sign-up is disabled; administrators create accounts in the Admin Dashboard. Configure `FRONTEND_BASE_URL` and the existing `EMAIL_*` settings in `backend/.env` for clickable setup, reset, and account-status emails.
+
+The student AI-learning migration adds separate, student-owned practice quizzes and attempts, study preferences/plans/tasks, deadline records, and persistent study reminders. Existing instructor-authored assessments and student enrollment/progress tables are reused without changing their behavior.
+
+### Configure AI Learning Tools
+
+Set the following in `backend/.env` to enable AI quiz generation, short-answer grading, and personalized plan generation:
+
+```env
+AI_PROVIDER=gemini
+AI_API_KEY=your-google-gemini-api-key
+AI_MODEL=gemini-3.8-flash
+AI_TIMEOUT_SECONDS=45
+```
+
+The Google Gemini API key is read only from the backend environment and is never returned by the API. With no key configured, AI-learning generation returns an explicit service-unavailable response rather than fabricated results. An existing `AI_PROVIDER=openai` value is temporarily accepted for compatibility, but still uses Google Gemini; update it to `gemini`. The legacy AI assistant remains unchanged.
+
+Student-only endpoints are under `/api/v1/student/ai-learning`: `/courses`, `/quizzes`, `/quizzes/history`, `/attempts/{id}`, and `/planner` (including plan, task, preference, and reminder operations). Every quiz, attempt, plan, task, and reminder is scoped to the authenticated student; quiz generation also requires an approved course enrollment and a selected module or lesson.
 
 ---
 

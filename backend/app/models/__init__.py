@@ -17,6 +17,27 @@ from app.models.announcement import CourseAnnouncement
 from app.models.discussion import CourseDiscussion, DiscussionReply
 from app.models.notification import Notification
 from app.models.email_delivery import EmailDelivery
+from app.models.instructor import InstructorPasswordToken, InstructorProfile
+from app.models.ai_learning import (
+    AIQuiz,
+    AIQuizAnswer,
+    AIQuizAttempt,
+    AIQuizOption,
+    AIQuizQuestion,
+    StudyDeadline,
+    StudyNotification,
+    StudyPlan,
+    StudyPreference,
+    StudyTask,
+)
+from app.models.instructor_ai import (
+    AssignmentEvaluation,
+    AssignmentEvaluationCriterion,
+    AssignmentRubric,
+    EvaluationCriterionRubric,
+    GeneratedQuestion,
+    QuestionPaper,
+)
 
 __all__ = [
     "User",
@@ -41,4 +62,22 @@ __all__ = [
     "DiscussionReply",
     "Notification",
     "EmailDelivery",
+    "InstructorProfile",
+    "InstructorPasswordToken",
+    "AIQuiz",
+    "AIQuizQuestion",
+    "AIQuizOption",
+    "AIQuizAttempt",
+    "AIQuizAnswer",
+    "StudyPreference",
+    "StudyPlan",
+    "StudyDeadline",
+    "StudyTask",
+    "StudyNotification",
+    "AssignmentRubric",
+    "EvaluationCriterionRubric",
+    "AssignmentEvaluation",
+    "AssignmentEvaluationCriterion",
+    "QuestionPaper",
+    "GeneratedQuestion",
 ]

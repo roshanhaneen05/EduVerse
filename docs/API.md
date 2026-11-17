@@ -22,6 +22,8 @@
 | :--- | :--- | :--- | :--- |
 | `POST` | `/register` | Register new student account | Public |
 | `POST` | `/login` | Authenticate and obtain JWT token | Public |
+| `POST` | `/instructor-login` | Authenticate an instructor with an admin-created profile | Public |
+| `POST` | `/instructor-password` | Set/reset instructor password with a single-use email token | Public |
 | `POST` | `/logout` | Log out and clear session cookie | Public |
 | `GET` | `/me` | Get current user profile | Authenticated |
 | `PUT` | `/profile` | Update profile information | Authenticated |
@@ -69,6 +71,7 @@
 | Method | Endpoint | Description | Role |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/instructor/dashboard` | Instructor statistics and recent student enrollments | Instructor / Admin |
+| `GET` | `/instructor/profile` | Instructor ID and academic profile for the signed-in instructor | Instructor / Admin |
 | `GET` | `/instructor/enrollments` | List student name, email, course, enrollment date, and status for the instructor's courses | Instructor / Admin |
 | `POST` | `/admin/email/test` | Send a test message to the supplied recipient (development only) | Admin |
 | `GET` | `/instructor/courses` | List courses owned by instructor | Instructor / Admin |
@@ -117,6 +120,14 @@ If the backend virtual environment is activated, `alembic upgrade head` is equiv
 | `GET` | `/admin/stats` | Platform-wide metrics (users, courses, quizzes) | Admin |
 | `GET` | `/admin/users` | List, search, and filter platform users | Admin |
 | `PUT` | `/admin/users/{id}` | Update user role (e.g. promote) or active status | Admin |
+| `GET` | `/admin/instructors?search=&department=&is_active=` | Search and filter instructor directory | Admin |
+| `POST` | `/admin/instructors` | Create an active instructor and send a password setup link | Admin |
+| `GET` | `/admin/instructors/{user_id}` | View instructor details | Admin |
+| `PUT` | `/admin/instructors/{user_id}` | Edit instructor contact and academic profile | Admin |
+| `PATCH` | `/admin/instructors/{user_id}/status` | Activate/deactivate instructor and email a notification | Admin |
+| `POST` | `/admin/instructors/{user_id}/password-reset` | Email a single-use password reset link | Admin |
+| `DELETE` | `/admin/instructors/{user_id}` | Delete instructor after their courses are reassigned | Admin |
+| `PUT` | `/admin/courses/{course_id}/instructor` | Assign a course to an active registered instructor | Admin |
 | `PATCH` | `/admin/courses/{id}/publish` | Toggle publication on any course | Admin |
 | `GET` | `/admin/analytics/dashboard` | Consolidated overview, student, course, instructor, trend, and activity analytics | Admin |
 | `GET` | `/admin/analytics/overview` | Platform summary statistics | Admin |
@@ -131,6 +142,8 @@ Analytics routes accept optional `start_date` and `end_date` query parameters in
 
 The Angular dashboard is available at `/admin/analytics` and is limited to authenticated administrators by the existing role guard. The API independently enforces the administrator role.
 
+Instructor self-registration through `POST /auth/register` is rejected; student self-registration remains available. The Admin Dashboard's Instructor Management page creates instructor accounts and assigns a generated instructor ID. New instructors receive a one-time password setup link, while password reset links expire after 24 hours and are stored only as token hashes. Set `FRONTEND_BASE_URL` in `backend/.env` to the frontend origin used in email links. SMTP errors are logged and returned as an email-delivery status without rolling back account changes. Apply the instructor profile/password-token migration with `python -m alembic upgrade head`; existing instructor users are backfilled with profile records to preserve their access and course ownership.
+
 ---
 
 ## 8. AI Learning Assistant (`/api/v1/ai`)
@@ -141,3 +154,30 @@ The Angular dashboard is available at `/admin/analytics` and is limited to authe
 | `GET` | `/ai/conversations` | List conversation histories | Authenticated |
 | `GET` | `/ai/conversations/{id}` | Retrieve messages in conversation | Authenticated |
 | `DELETE` | `/ai/conversations/{id}` | Delete conversation | Authenticated |
+
+---
+
+## 9. Student AI Learning Tools (`/api/v1/student/ai-learning`)
+
+All endpoints in this section require the student role. Quiz generation requires an approved enrollment and one selected course module or lesson. Correct answers are withheld until an attempt is submitted. Quiz attempts, plans, tasks, preferences, and reminders are restricted to their owning student.
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/student/ai-learning/courses` | List approved courses and their module/lesson outlines |
+| `POST` | `/student/ai-learning/quizzes` | Generate a lesson-grounded practice quiz |
+| `POST` | `/student/ai-learning/quizzes/{quiz_id}/attempts` | Start a timed quiz attempt |
+| `POST` | `/student/ai-learning/attempts/{attempt_id}/submit` | Score objective answers and AI-grade short answers |
+| `GET` | `/student/ai-learning/attempts/{attempt_id}` | Review a submitted attempt with answer explanations |
+| `GET` | `/student/ai-learning/quizzes/history` | List the student's AI practice attempts |
+| `POST` | `/student/ai-learning/attempts/{attempt_id}/request-review` | Notify the course instructor about automated short-answer grading |
+| `GET` | `/student/ai-learning/planner` | Load preferences, progress, timetable, recommendations, and reminders |
+| `PUT` | `/student/ai-learning/planner/preferences` | Save selected courses, study hours/time, deadlines, and target date |
+| `POST` | `/student/ai-learning/planner/generate` | Generate and persist a personalized lesson schedule |
+| `PATCH` | `/student/ai-learning/planner/tasks/{task_id}` | Mark an owned task completed |
+| `PUT` | `/student/ai-learning/planner/tasks/{task_id}/schedule` | Reschedule an owned pending or missed task |
+| `DELETE` | `/student/ai-learning/planner/tasks/{task_id}` | Delete an owned task in the active plan |
+| `PATCH` | `/student/ai-learning/planner/reminders/{reminder_id}/read` | Dismiss an owned study reminder |
+
+Configure `AI_PROVIDER=gemini`, `AI_API_KEY`, `AI_MODEL`, and optionally `AI_TIMEOUT_SECONDS` in `backend/.env` (see `backend/.env.example`). Quiz generation receives the selected lesson text; planner generation receives the student's real lesson progress, course quiz scores, assignment deadlines, study preferences, and previous task history. Responses are validated before they are stored. Without an AI provider key, generation returns an explicit `503`; provider and invalid-response failures do not produce fabricated results. On Windows, the `tzdata` dependency supplies IANA time-zone rules used to schedule tasks in the student's local time zone.
+
+Apply the additive student AI-learning schema with `python -m alembic upgrade head` from `backend`; the current migration revision is `7b2c4e6a9d10`. Student entry points are available at `/student/ai-quiz` and `/student/study-planner`.

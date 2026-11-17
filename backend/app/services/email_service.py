@@ -150,6 +150,84 @@ def send_enrollment_email(
     )
 
 
+def build_instructor_password_email(
+    instructor: User,
+    profile,
+    setup_link: str,
+    settings: Settings,
+    purpose: str,
+) -> EmailMessage:
+    is_reset = purpose == "reset"
+    return _build_branded_email(
+        recipient=instructor.email,
+        recipient_field="Instructor email",
+        subject=(
+            "Reset Your EduVerse Instructor Password"
+            if is_reset
+            else "Welcome to the EduVerse Faculty - Set Up Your Account"
+        ),
+        greeting=f"Hello {instructor.full_name},",
+        introduction=(
+            "An administrator requested a password reset for your EduVerse instructor account. "
+            "Use the secure link below to choose a new password."
+            if is_reset
+            else "An administrator has registered you as an EduVerse instructor. "
+            "Use the secure link below to set your password."
+        ),
+        details=[
+            ("Instructor ID", profile.instructor_id),
+            ("Login email", instructor.email),
+            ("Login page", f"{settings.FRONTEND_BASE_URL.rstrip('/')}/instructor/login"),
+        ],
+        closing="This one-time password link expires in 24 hours.",
+        settings=settings,
+        action_url=setup_link,
+        action_label="Set your password",
+    )
+
+
+def build_instructor_status_email(
+    instructor: User,
+    profile,
+    settings: Settings,
+) -> EmailMessage:
+    active = instructor.is_active
+    return _build_branded_email(
+        recipient=instructor.email,
+        recipient_field="Instructor email",
+        subject=f"EduVerse Instructor Account {'Activated' if active else 'Deactivated'}",
+        greeting=f"Hello {instructor.full_name},",
+        introduction=(
+            "Your EduVerse instructor account has been activated."
+            if active
+            else "Your EduVerse instructor account has been deactivated. You can no longer sign in."
+        ),
+        details=[
+            ("Instructor ID", profile.instructor_id),
+            ("Account status", "Active" if active else "Deactivated"),
+        ],
+        closing="Contact your institution administrator if you have questions.",
+        settings=settings,
+    )
+
+
+def send_instructor_password_email(
+    instructor: User,
+    profile,
+    setup_link: str,
+    settings: Settings,
+    purpose: str,
+) -> None:
+    _send_smtp_message(
+        build_instructor_password_email(instructor, profile, setup_link, settings, purpose),
+        settings,
+    )
+
+
+def send_instructor_status_email(instructor: User, profile, settings: Settings) -> None:
+    _send_smtp_message(build_instructor_status_email(instructor, profile, settings), settings)
+
+
 def _build_branded_email(
     recipient: str,
     recipient_field: str,
@@ -159,6 +237,8 @@ def _build_branded_email(
     details: list[tuple[str, str]],
     closing: str,
     settings: Settings,
+    action_url: str | None = None,
+    action_label: str | None = None,
 ) -> EmailMessage:
     sender = _validate_smtp_configuration(settings)
     recipient = _validate_email_address(recipient, recipient_field)
@@ -176,10 +256,21 @@ def _build_branded_email(
 
 {closing}
 
+{f'{action_label}: {action_url}' if action_url and action_label else ''}
+
 Warm regards,
 EduVerse Team
 """
     )
+    action_button = ""
+    if action_url and action_label:
+        safe_url = escape(action_url, quote=True)
+        action_button = (
+            f'<p style="margin:24px 0 0;text-align:center;">'
+            f'<a href="{safe_url}" style="display:inline-block;padding:12px 20px;'
+            f'background:#e83e8c;color:#ffffff;text-decoration:none;border-radius:8px;'
+            f'font-weight:bold;">{escape(action_label)}</a></p>'
+        )
     detail_rows = "".join(
         f"""<tr>
           <td class="detail-label">{escape(label)}</td>
@@ -234,6 +325,7 @@ EduVerse Team
               <p style="margin:24px 0 0;color:#62545b;line-height:1.6;">
                 {escape(closing)}
               </p>
+              {action_button}
               <p style="margin:24px 0 0;color:#62545b;line-height:1.6;">Warm regards,<br><strong style="color:#a91f61;">EduVerse Team</strong></p>
             </td>
           </tr>

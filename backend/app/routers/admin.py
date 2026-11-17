@@ -15,6 +15,7 @@ from app.models.assignment import Assignment, AssignmentSubmission
 from app.models.course import Course
 from app.models.email_delivery import EmailDelivery
 from app.models.enrollment import CourseEnrollment
+from app.models.instructor import InstructorProfile
 from app.models.lesson import Lesson
 from app.models.material import LearningMaterial
 from app.models.quiz import Quiz, QuizAttempt
@@ -374,6 +375,11 @@ def update_user_status_or_role(
                 detail=f"Invalid role. Must be one of {valid_roles}",
             )
         user.role = user_update.role
+        if user.role == UserRole.INSTRUCTOR.value and not user.instructor_profile:
+            user.instructor_profile = InstructorProfile(
+                instructor_id=f"EV-I-{user.id:08d}",
+                registered_at=user.created_at,
+            )
 
     if user_update.is_active is not None:
         user.is_active = user_update.is_active

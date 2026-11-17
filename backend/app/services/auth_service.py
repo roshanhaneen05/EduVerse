@@ -39,7 +39,10 @@ def register_user(db: Session, user_in: UserCreate) -> User:
             detail="Self-registration as Administrator is not permitted.",
         )
     elif requested_role == UserRole.INSTRUCTOR.value:
-        assigned_role = UserRole.INSTRUCTOR.value
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Instructor accounts must be created by an administrator.",
+        )
     else:
         assigned_role = UserRole.STUDENT.value
 

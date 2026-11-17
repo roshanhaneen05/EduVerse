@@ -58,6 +58,12 @@ class User(Base):
     ai_conversations = relationship("AIConversation", back_populates="user", cascade="all, delete-orphan")
     uploaded_materials = relationship("LearningMaterial", back_populates="uploader", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan", order_by="Notification.created_at.desc()")
+    instructor_profile = relationship(
+        "InstructorProfile",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     def __init__(self, **kwargs):
         if "hashed_password" in kwargs and "password_hash" not in kwargs:

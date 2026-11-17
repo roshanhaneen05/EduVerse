@@ -11,6 +11,7 @@ from app.models.section import CourseSection
 from app.models.enrollment import CourseEnrollment
 from app.models.email_delivery import EmailDelivery
 from app.models.lesson import Lesson
+from app.models.instructor import InstructorProfile
 from app.services.file_validator import validate_upload_content
 from app.services.storage import get_storage_provider
 from app.models.quiz import (
@@ -20,6 +21,7 @@ from app.models.quiz import (
 )
 from app.models.user import User
 from app.schemas.admin import InstructorDashboardStats
+from app.schemas.instructor import InstructorResponse
 from app.schemas.enrollment import (
     EnrollmentDecisionResponse,
     InstructorEnrollmentResponse,
@@ -106,6 +108,38 @@ def check_course_ownership(course: Course, user: User):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to manage this course.",
         )
+
+
+@router.get(
+    "/profile",
+    response_model=InstructorResponse,
+    summary="Get the authenticated instructor's profile",
+)
+def get_instructor_profile(
+    current_user: User = Depends(require_instructor),
+    db: Session = Depends(get_db),
+):
+    profile = (
+        db.query(InstructorProfile)
+        .filter(InstructorProfile.user_id == current_user.id)
+        .first()
+    )
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor profile not found.")
+    return InstructorResponse(
+        user_id=current_user.id,
+        instructor_id=profile.instructor_id,
+        full_name=current_user.full_name,
+        email=current_user.email,
+        phone_number=profile.phone_number,
+        qualification=profile.qualification,
+        department=profile.department,
+        subject_expertise=profile.subject_expertise,
+        experience_years=profile.experience_years,
+        profile_photo_url=profile.profile_photo_url,
+        is_active=current_user.is_active,
+        registered_at=profile.registered_at,
+    )
 
 
 @router.get(
