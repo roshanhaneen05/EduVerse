@@ -5,16 +5,24 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime
 from html import escape
+from typing import Any
 
 from pydantic import EmailStr, TypeAdapter, ValidationError
-from sqlalchemy import update
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
 
 from app.config import Settings
-from app.models.course import Course
-from app.models.email_delivery import EmailDelivery
-from app.models.enrollment import CourseEnrollment
-from app.models.user import User
+from app.repositories.communication_repository import (
+    MongoEmailDelivery,
+    claim_email_delivery_for_sending,
+    update_email_delivery_doc,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    MongoCourseEnrollment,
+    get_course_by_id,
+    get_enrollment_by_id,
+)
+from app.repositories.user_repository import MongoUser, get_user_by_id, get_users_by_ids
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +80,10 @@ def _send_smtp_message(message: EmailMessage, settings: Settings) -> None:
 
 
 def build_enrollment_email(
-    enrollment: CourseEnrollment,
-    student: User,
-    course: Course,
-    instructor: User,
+    enrollment: MongoCourseEnrollment | Any,
+    student: MongoUser | Any,
+    course: MongoCourse | Any,
+    instructor: MongoUser | Any,
     settings: Settings,
     recipient_email: str | None = None,
 ) -> EmailMessage:
@@ -98,10 +106,10 @@ def build_enrollment_email(
 
 
 def build_approval_email(
-    enrollment: CourseEnrollment,
-    student: User,
-    course: Course,
-    instructor: User,
+    enrollment: MongoCourseEnrollment | Any,
+    student: MongoUser | Any,
+    course: MongoCourse | Any,
+    instructor: MongoUser | Any,
     settings: Settings,
     recipient_email: str | None = None,
 ) -> EmailMessage:
@@ -118,10 +126,10 @@ def build_approval_email(
 
 
 def build_rejection_email(
-    enrollment: CourseEnrollment,
-    student: User,
-    course: Course,
-    instructor: User,
+    enrollment: MongoCourseEnrollment | Any,
+    student: MongoUser | Any,
+    course: MongoCourse | Any,
+    instructor: MongoUser | Any,
     settings: Settings,
     recipient_email: str | None = None,
 ) -> EmailMessage:
@@ -138,10 +146,10 @@ def build_rejection_email(
 
 
 def send_enrollment_email(
-    enrollment: CourseEnrollment,
-    student: User,
-    course: Course,
-    instructor: User,
+    enrollment: MongoCourseEnrollment | Any,
+    student: MongoUser | Any,
+    course: MongoCourse | Any,
+    instructor: MongoUser | Any,
     settings: Settings,
 ) -> None:
     _send_smtp_message(
@@ -151,8 +159,8 @@ def send_enrollment_email(
 
 
 def build_instructor_password_email(
-    instructor: User,
-    profile,
+    instructor: MongoUser | Any,
+    profile: Any,
     setup_link: str,
     settings: Settings,
     purpose: str,
@@ -187,8 +195,8 @@ def build_instructor_password_email(
 
 
 def build_instructor_status_email(
-    instructor: User,
-    profile,
+    instructor: MongoUser | Any,
+    profile: Any,
     settings: Settings,
 ) -> EmailMessage:
     active = instructor.is_active
@@ -212,8 +220,8 @@ def build_instructor_status_email(
 
 
 def send_instructor_password_email(
-    instructor: User,
-    profile,
+    instructor: MongoUser | Any,
+    profile: Any,
     setup_link: str,
     settings: Settings,
     purpose: str,
@@ -224,7 +232,11 @@ def send_instructor_password_email(
     )
 
 
-def send_instructor_status_email(instructor: User, profile, settings: Settings) -> None:
+def send_instructor_status_email(
+    instructor: MongoUser | Any,
+    profile: Any,
+    settings: Settings,
+) -> None:
     _send_smtp_message(build_instructor_status_email(instructor, profile, settings), settings)
 
 
@@ -343,120 +355,110 @@ EduVerse Team
 
 
 def send_email_delivery(
-    db: Session,
-    delivery: EmailDelivery,
+    mongo_db: Database,
+    delivery: MongoEmailDelivery,
     settings: Settings,
 ) -> str:
     if delivery.status == "sent":
         return "sent"
 
-    enrollment = (
-        db.query(CourseEnrollment)
-        .options(
-            joinedload(CourseEnrollment.student),
-            joinedload(CourseEnrollment.course).joinedload(Course.instructor),
+    enrollment = get_enrollment_by_id(mongo_db, delivery.enrollment_id)
+    course = get_course_by_id(mongo_db, enrollment.course_id) if enrollment else None
+    student = get_user_by_id(mongo_db, enrollment.student_id) if enrollment else None
+    if not enrollment or not student or not course:
+        update_email_delivery_doc(
+            mongo_db,
+            delivery.id,
+            {"status": "failed", "last_error": "EnrollmentDataUnavailable"},
         )
-        .filter(CourseEnrollment.id == delivery.enrollment_id)
-        .first()
-    )
-    if not enrollment or not enrollment.student or not enrollment.course:
-        delivery.status = "failed"
-        delivery.last_error = "EnrollmentDataUnavailable"
-        db.commit()
         return "failed"
 
     instructor_id = (
-        enrollment.course.instructor_id
+        course.instructor_id
         if delivery.event_type == ENROLLMENT_REQUEST
-        else enrollment.reviewed_by_instructor_id or enrollment.course.instructor_id
+        else enrollment.reviewed_by_instructor_id or course.instructor_id
     )
-    instructor = db.query(User).filter(User.id == instructor_id).first()
+    instructor = get_users_by_ids(mongo_db, [instructor_id]).get(instructor_id)
     if not instructor:
-        delivery.status = "failed"
-        delivery.last_error = "InstructorUnavailable"
-        db.commit()
+        update_email_delivery_doc(
+            mongo_db,
+            delivery.id,
+            {"status": "failed", "last_error": "InstructorUnavailable"},
+        )
         return "failed"
 
-    claimed = db.execute(
-        update(EmailDelivery)
-        .where(
-            EmailDelivery.id == delivery.id,
-            EmailDelivery.status.in_(("pending", "failed")),
-        )
-        .values(
-            status="sending",
-            attempts=EmailDelivery.attempts + 1,
-            last_error=None,
-            updated_at=datetime.now(timezone.utc),
-        )
-    ).rowcount
-    db.commit()
+    claimed = claim_email_delivery_for_sending(mongo_db, delivery.id)
     if not claimed:
-        db.refresh(delivery)
-        return "sent" if delivery.status == "sent" else "failed"
-    db.refresh(delivery)
+        latest = mongo_db["email_deliveries"].find_one({"id": int(delivery.id)})
+        return "sent" if latest and latest.get("status") == "sent" else "failed"
 
     try:
-        if delivery.event_type == ENROLLMENT_REQUEST:
+        if claimed.event_type == ENROLLMENT_REQUEST:
             message = build_enrollment_email(
                 enrollment,
-                enrollment.student,
-                enrollment.course,
+                student,
+                course,
                 instructor,
                 settings,
-                delivery.recipient_email,
+                claimed.recipient_email,
             )
-        elif delivery.event_type == ENROLLMENT_APPROVED:
+        elif claimed.event_type == ENROLLMENT_APPROVED:
             if enrollment.status != "approved":
                 raise ValueError("Approval notification no longer matches enrollment status.")
             message = build_approval_email(
                 enrollment,
-                enrollment.student,
-                enrollment.course,
+                student,
+                course,
                 instructor,
                 settings,
-                delivery.recipient_email,
+                claimed.recipient_email,
             )
-        elif delivery.event_type == ENROLLMENT_REJECTED:
+        elif claimed.event_type == ENROLLMENT_REJECTED:
             if enrollment.status != "rejected":
                 raise ValueError("Rejection notification no longer matches enrollment status.")
             message = build_rejection_email(
                 enrollment,
-                enrollment.student,
-                enrollment.course,
+                student,
+                course,
                 instructor,
                 settings,
-                delivery.recipient_email,
+                claimed.recipient_email,
             )
         else:
             raise ValueError("Unknown enrollment email event.")
 
         _send_smtp_message(message, settings)
     except EmailNotConfiguredError as exc:
-        delivery.status = "failed"
-        delivery.last_error = type(exc).__name__
-        db.commit()
+        update_email_delivery_doc(
+            mongo_db,
+            claimed.id,
+            {"status": "failed", "last_error": type(exc).__name__},
+        )
         logger.warning(
             "Email delivery %s (%s) is not configured; retry after SMTP configuration.",
-            delivery.id,
-            delivery.event_type,
+            claimed.id,
+            claimed.event_type,
         )
         return "not_configured"
     except (smtplib.SMTPException, OSError, ValueError) as exc:
-        delivery.status = "failed"
-        delivery.last_error = type(exc).__name__
-        db.commit()
+        update_email_delivery_doc(
+            mongo_db,
+            claimed.id,
+            {"status": "failed", "last_error": type(exc).__name__},
+        )
         logger.error(
             "Email delivery %s (%s) failed with %s.",
-            delivery.id,
-            delivery.event_type,
+            claimed.id,
+            claimed.event_type,
             type(exc).__name__,
         )
         return "failed"
 
-    delivery.status = "sent"
-    delivery.sent_at = datetime.now(timezone.utc)
-    db.commit()
+    update_email_delivery_doc(
+        mongo_db,
+        claimed.id,
+        {"status": "sent", "sent_at": datetime.now(timezone.utc)},
+    )
     return "sent"
 
 

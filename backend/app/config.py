@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 500
     STORAGE_PROVIDER_TYPE: str = "local"
 
+    # MongoDB Atlas (credentials must only be supplied via environment / .env)
+    MONGODB_URL: str = ""
+    MONGODB_DATABASE: str = "eduverse"
+    MONGODB_SERVER_SELECTION_TIMEOUT_MS: int = 5000
+    MONGODB_CONNECT_TIMEOUT_MS: int = 10000
+
     # CORS
     CORS_ORIGINS: Union[List[str], str] = (
         "http://localhost:4200,http://127.0.0.1:4200,http://[::1]:4200"
@@ -93,14 +99,38 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_security(self) -> "Settings":
-        """Enforce strict secret entropy in production environments."""
+        """Enforce strict secret entropy in production environments and validate MongoDB settings."""
         if self.is_production:
             if "dev-secret-key" in self.SECRET_KEY or len(self.SECRET_KEY) < 32:
                 raise ValueError(
                     "Insecure production configuration: SECRET_KEY must be a unique, high-entropy secret "
                     "at least 32 characters long in production environments."
                 )
+        mongo_url = self.MONGODB_URL.strip()
+        if mongo_url and not (
+            mongo_url.startswith("mongodb://") or mongo_url.startswith("mongodb+srv://")
+        ):
+            raise ValueError(
+                "Invalid MONGODB_URL: connection string must start with 'mongodb://' or 'mongodb+srv://'."
+            )
+        if not self.MONGODB_DATABASE.strip():
+            raise ValueError("Invalid MONGODB_DATABASE: database name must not be empty.")
         return self
+
+    @property
+    def has_mongo_config(self) -> bool:
+        mongo_url = self.MONGODB_URL.strip()
+        if not mongo_url:
+            return False
+        placeholder_markers = (
+            "YOUR_USERNAME",
+            "YOUR_PASSWORD",
+            "YOUR_CLUSTER",
+            "<username>",
+            "<password>",
+            "<cluster>",
+        )
+        return not any(marker in mongo_url for marker in placeholder_markers)
 
     @property
     def resolved_data_dir(self) -> Path:

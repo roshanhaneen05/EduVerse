@@ -2,12 +2,26 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 from app.database import SessionLocal
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.quiz import Quiz, QuizAttempt
-from app.models.section import CourseSection
-from app.models.user import User
+from app.mongodb import get_mongo_database
+from app.repositories.course_repository import (
+    create_course_doc,
+    create_enrollment_doc,
+    create_lesson_doc,
+    create_section_doc,
+    sync_course_to_sqlite_shadow,
+    sync_enrollment_to_sqlite_shadow,
+    sync_lesson_progress_to_sqlite_shadow,
+    sync_lesson_to_sqlite_shadow,
+    sync_section_to_sqlite_shadow,
+    upsert_lesson_progress,
+)
+from app.repositories.quiz_repository import (
+    create_quiz_attempt_doc,
+    create_quiz_doc,
+    sync_quiz_attempt_to_sqlite_shadow,
+    sync_quiz_to_sqlite_shadow,
+)
+from app.repositories.user_repository import get_user_by_email, list_all_users
 
 
 def _token(client, email: str, password: str = "EduVerseDemo2026!") -> str:
@@ -17,13 +31,17 @@ def _token(client, email: str, password: str = "EduVerseDemo2026!") -> str:
 
 
 def _create_enrolled_course(student_email: str, *, lesson_count: int = 1) -> dict:
+    mongo_db = get_mongo_database()
     db = SessionLocal()
     try:
-        student = db.query(User).filter(User.email == student_email).one()
-        instructor = db.query(User).filter(User.role == "instructor").first()
-        assert instructor is not None
+        student = get_user_by_email(mongo_db, student_email)
+        assert student is not None
+        instructors = list_all_users(mongo_db, role="instructor")
+        assert instructors
+        instructor = instructors[0]
         suffix = uuid4().hex[:12]
-        course = Course(
+        course = create_course_doc(
+            mongo_db,
             title=f"AI Learning Test {suffix}",
             description="A course used to verify student AI learning tools.",
             category="Testing",
@@ -31,14 +49,19 @@ def _create_enrolled_course(student_email: str, *, lesson_count: int = 1) -> dic
             instructor_id=instructor.id,
             is_published=True,
         )
-        db.add(course)
-        db.flush()
-        section = CourseSection(course_id=course.id, title="Foundations", order_index=1)
-        db.add(section)
-        db.flush()
+        sync_course_to_sqlite_shadow(db, course)
+        section = create_section_doc(
+            mongo_db,
+            course_id=course.id,
+            title="Foundations",
+            description=None,
+            order_index=1,
+        )
+        sync_section_to_sqlite_shadow(db, section)
         lessons = []
         for index in range(lesson_count):
-            lesson = Lesson(
+            lesson = create_lesson_doc(
+                mongo_db,
                 course_id=course.id,
                 section_id=section.id,
                 title=f"Lesson {index + 1}",
@@ -46,18 +69,18 @@ def _create_enrolled_course(student_email: str, *, lesson_count: int = 1) -> dic
                     "Python lists preserve insertion order and allow indexed access. "
                     "The append operation adds an item to the end of a list."
                 ),
+                video_url=None,
                 order_index=index + 1,
             )
-            db.add(lesson)
+            sync_lesson_to_sqlite_shadow(db, lesson)
             lessons.append(lesson)
-        db.add(
-            CourseEnrollment(
-                student_id=student.id,
-                course_id=course.id,
-                status="approved",
-            )
+        enrollment = create_enrollment_doc(
+            mongo_db,
+            student_id=student.id,
+            course_id=course.id,
+            enrollment_status="approved",
         )
-        db.commit()
+        sync_enrollment_to_sqlite_shadow(db, enrollment)
         return {
             "course_id": course.id,
             "section_id": section.id,
@@ -223,36 +246,41 @@ def test_study_plan_uses_real_progress_and_supports_task_actions(client, monkeyp
 
     email, password = _create_student(client)
     course = _create_enrolled_course(email, lesson_count=3)
+    mongo_db = get_mongo_database()
     db = SessionLocal()
     try:
         completed_lesson_id = course["lesson_ids"][0]
-        db.add(
-            LessonProgress(
-                student_id=course["student_id"],
-                lesson_id=completed_lesson_id,
-                is_completed=True,
-                completed_at=datetime.now(timezone.utc),
-            )
+        lp = upsert_lesson_progress(
+            mongo_db,
+            student_id=course["student_id"],
+            lesson_id=completed_lesson_id,
+            is_completed=True,
         )
-        instructor_quiz = Quiz(
+        sync_lesson_progress_to_sqlite_shadow(db, lp)
+        instructor_quiz = create_quiz_doc(
+            mongo_db,
             course_id=course["course_id"],
+            section_id=None,
+            lesson_id=None,
             title="Low score signal",
+            description=None,
             passing_score=70,
             is_published=True,
+            time_limit_minutes=None,
+            max_attempts=3,
         )
-        db.add(instructor_quiz)
-        db.flush()
-        db.add(
-            QuizAttempt(
-                quiz_id=instructor_quiz.id,
-                student_id=course["student_id"],
-                score=30,
-                total_points=100,
-                passed=False,
-                is_completed=True,
-            )
+        sync_quiz_to_sqlite_shadow(db, instructor_quiz)
+        attempt = create_quiz_attempt_doc(
+            mongo_db,
+            quiz_id=instructor_quiz.id,
+            student_id=course["student_id"],
+            attempt_number=1,
+            score=30.0,
+            total_points=100,
+            passed=False,
+            is_completed=True,
         )
-        db.commit()
+        sync_quiz_attempt_to_sqlite_shadow(db, attempt)
     finally:
         db.close()
 

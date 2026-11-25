@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 import pytest
 
+from app.mongo_schema import next_sequence_id
+from app.mongodb import get_mongo_database
+
 
 def get_token(client, email: str, password: str = "EduVerseDemo2026!") -> str:
     res = client.post("/api/v1/auth/login", json={"email": email, "password": password})
@@ -297,6 +300,13 @@ def test_grading_workflow_and_validation(client):
 
 
 def test_safe_assignment_deletion_and_archival(client):
+    mongo_db = get_mongo_database()
+
+    def add(collection: str, **fields) -> int:
+        doc_id = next_sequence_id(mongo_db, collection)
+        mongo_db[collection].insert_one({"id": doc_id, **fields})
+        return doc_id
+
     sarah_token = get_token(client, "sarah.chen@eduverse.io")
     alex_token = get_token(client, "alex.rivera@eduverse.io")
     sarah_headers = {"Authorization": f"Bearer {sarah_token}"}
@@ -309,9 +319,27 @@ def test_safe_assignment_deletion_and_archival(client):
         headers=sarah_headers,
     ).json()
 
+    rubric_id = add("assignment_rubrics", assignment_id=assign_empty["id"])
+    rubric_criterion_id = add(
+        "evaluation_criterion_rubrics", rubric_id=rubric_id, order_index=1
+    )
+    unrelated_rubric_id = add("assignment_rubrics", assignment_id=999999)
+    unrelated_criterion_id = add(
+        "evaluation_criterion_rubrics", rubric_id=unrelated_rubric_id, order_index=1
+    )
+
     del_empty = client.delete(f"/api/v1/instructor/assignments/{assign_empty['id']}", headers=sarah_headers)
     assert del_empty.status_code == 200
     assert del_empty.json()["archived"] is False
+    assert mongo_db["assignment_rubrics"].find_one({"id": rubric_id}) is None
+    assert (
+        mongo_db["evaluation_criterion_rubrics"].find_one({"id": rubric_criterion_id}) is None
+    )
+    assert mongo_db["assignment_rubrics"].find_one({"id": unrelated_rubric_id}) is not None
+    assert (
+        mongo_db["evaluation_criterion_rubrics"].find_one({"id": unrelated_criterion_id})
+        is not None
+    )
 
     # 2. Assignment WITH student submissions
     assign_with_subs = client.post(
@@ -324,16 +352,53 @@ def test_safe_assignment_deletion_and_archival(client):
         headers=sarah_headers,
     ).json()
 
-    client.post(
+    submission_resp = client.post(
         f"/api/v1/assignments/{assign_with_subs['id']}/submit",
         json={"submission_text": "Vital student research project."},
         headers=alex_headers,
+    )
+    assert submission_resp.status_code == 200
+    submission_id = submission_resp.json()["id"]
+    submitted_rubric_id = add(
+        "assignment_rubrics", assignment_id=assign_with_subs["id"]
+    )
+    submitted_rubric_criterion_id = add(
+        "evaluation_criterion_rubrics",
+        rubric_id=submitted_rubric_id,
+        order_index=1,
+    )
+    evaluation_id = add(
+        "assignment_evaluations",
+        assignment_id=assign_with_subs["id"],
+        submission_id=submission_id,
+        student_id=3,
+        instructor_id=2,
+    )
+    evaluation_criterion_id = add(
+        "assignment_evaluation_criteria",
+        evaluation_id=evaluation_id,
+        order_index=1,
     )
 
     # Attempt to permanently delete without archive flag -> 400 Bad Request
     del_blocked = client.delete(f"/api/v1/instructor/assignments/{assign_with_subs['id']}", headers=sarah_headers)
     assert del_blocked.status_code == 400
     assert "contains student submissions" in del_blocked.json()["detail"]
+    assert mongo_db["assignment_submissions"].find_one({"id": submission_id}) is not None
+    assert mongo_db["assignment_rubrics"].find_one({"id": submitted_rubric_id}) is not None
+    assert (
+        mongo_db["evaluation_criterion_rubrics"].find_one(
+            {"id": submitted_rubric_criterion_id}
+        )
+        is not None
+    )
+    assert mongo_db["assignment_evaluations"].find_one({"id": evaluation_id}) is not None
+    assert (
+        mongo_db["assignment_evaluation_criteria"].find_one(
+            {"id": evaluation_criterion_id}
+        )
+        is not None
+    )
 
     # Delete with archive_if_submissions=True -> Safely archived
     del_archived = client.delete(
@@ -342,6 +407,21 @@ def test_safe_assignment_deletion_and_archival(client):
     )
     assert del_archived.status_code == 200
     assert del_archived.json()["archived"] is True
+    assert mongo_db["assignment_submissions"].find_one({"id": submission_id}) is not None
+    assert mongo_db["assignment_rubrics"].find_one({"id": submitted_rubric_id}) is not None
+    assert (
+        mongo_db["evaluation_criterion_rubrics"].find_one(
+            {"id": submitted_rubric_criterion_id}
+        )
+        is not None
+    )
+    assert mongo_db["assignment_evaluations"].find_one({"id": evaluation_id}) is not None
+    assert (
+        mongo_db["assignment_evaluation_criteria"].find_one(
+            {"id": evaluation_criterion_id}
+        )
+        is not None
+    )
 
     # Verify student submission is still preserved
     alex_check = client.get(f"/api/v1/assignments/{assign_with_subs['id']}/my-submission", headers=alex_headers)

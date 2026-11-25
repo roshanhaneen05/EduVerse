@@ -13,10 +13,11 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db, require_instructor
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db, require_instructor
+from app.repositories.user_repository import MongoUser, get_user_by_id
 from app.schemas.common import MessageResponse
 from app.schemas.material import MaterialResponse, MaterialUpdate
 from app.security.jwt import decode_access_token
@@ -36,8 +37,8 @@ http_bearer = HTTPBearer(auto_error=False)
 def get_current_user_flexible(
     auth: Optional[HTTPAuthorizationCredentials] = Depends(http_bearer),
     token: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-) -> User:
+    mongo_db: Database = Depends(get_mongo_db),
+) -> MongoUser:
     """Authorize user via either Authorization Bearer header or ?token query param."""
     raw_token = None
     if auth and auth.credentials:
@@ -60,7 +61,7 @@ def get_current_user_flexible(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user = db.query(User).filter(User.id == int(payload["sub"])).first()
+    user = get_user_by_id(mongo_db, int(payload["sub"]))
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -87,7 +88,8 @@ async def upload_material(
     section_id: Optional[int] = Form(None),
     lesson_id: Optional[int] = Form(None),
     file: UploadFile = File(...),
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     """
@@ -96,7 +98,7 @@ async def upload_material(
     """
     content = await file.read()
     return service_upload_course_material(
-        db=db,
+        mongo_db=mongo_db,
         course_id=course_id,
         file_content=content,
         original_filename=file.filename or "material",
@@ -106,6 +108,7 @@ async def upload_material(
         section_id=section_id if section_id and section_id > 0 else None,
         lesson_id=lesson_id if lesson_id and lesson_id > 0 else None,
         current_user=current_user,
+        sqlite_db=db,
     )
 
 
@@ -118,12 +121,12 @@ def list_course_materials(
     course_id: int,
     section_id: Optional[int] = Query(None),
     lesson_id: Optional[int] = Query(None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """Retrieve all materials for an enrolled or owned course."""
     return service_list_course_materials(
-        db=db,
+        mongo_db=mongo_db,
         course_id=course_id,
         current_user=current_user,
         section_id=section_id,
@@ -138,11 +141,11 @@ def list_course_materials(
 )
 def get_material_detail(
     material_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """Retrieve metadata for a specific material."""
-    return service_get_material_detail(db, material_id, current_user)
+    return service_get_material_detail(mongo_db, material_id, current_user)
 
 
 @router.put(
@@ -153,11 +156,18 @@ def get_material_detail(
 def update_material(
     material_id: int,
     update_data: MaterialUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     """Update title, description, or module linkages for an authorized material."""
-    return service_update_material(db, material_id, update_data, current_user)
+    return service_update_material(
+        mongo_db,
+        material_id,
+        update_data,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.delete(
@@ -167,11 +177,12 @@ def update_material(
 )
 def delete_material(
     material_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     """Safely delete material record and clean up associated storage file."""
-    res = service_delete_material(db, material_id, current_user)
+    res = service_delete_material(mongo_db, material_id, current_user, sqlite_db=db)
     return MessageResponse(message=res["message"])
 
 
@@ -181,8 +192,8 @@ def delete_material(
 )
 def download_material(
     material_id: int,
-    current_user: User = Depends(get_current_user_flexible),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user_flexible),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Securely stream the authorized file.
@@ -190,9 +201,8 @@ def download_material(
     Enforces student course enrollment or instructor ownership.
     Accepts Authorization Bearer header OR ?token= query parameter for direct browser downloads.
     """
-    mat, file_source = service_get_material_file(db, material_id, current_user)
+    mat, file_source = service_get_material_file(mongo_db, material_id, current_user)
 
-    # Encode filename safely for Content-Disposition
     ascii_filename = mat.original_filename.encode("ascii", "ignore").decode("ascii") or "material"
 
     if isinstance(file_source, Path):

@@ -1,9 +1,10 @@
 from typing import List
 from fastapi import APIRouter, Depends, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db, require_instructor
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db, require_instructor
+from app.repositories.user_repository import MongoUser
 from app.schemas.announcement import (
     AnnouncementCreate,
     AnnouncementResponse,
@@ -28,10 +29,10 @@ router = APIRouter(tags=["Course Announcements"])
 )
 def list_announcements(
     course_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return service_list_course_announcements(db, course_id, current_user)
+    return service_list_course_announcements(mongo_db, course_id, current_user)
 
 
 @router.post(
@@ -43,10 +44,17 @@ def list_announcements(
 def create_announcement_endpoint(
     course_id: int,
     announcement_in: AnnouncementCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_create_announcement(db, course_id, announcement_in, current_user)
+    return service_create_announcement(
+        mongo_db,
+        course_id,
+        announcement_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.get(
@@ -56,10 +64,10 @@ def create_announcement_endpoint(
 )
 def get_announcement_endpoint(
     announcement_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return service_get_announcement_detail(db, announcement_id, current_user)
+    return service_get_announcement_detail(mongo_db, announcement_id, current_user)
 
 
 @router.put(
@@ -70,10 +78,17 @@ def get_announcement_endpoint(
 def update_announcement_endpoint(
     announcement_id: int,
     announcement_in: AnnouncementUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_update_announcement(db, announcement_id, announcement_in, current_user)
+    return service_update_announcement(
+        mongo_db,
+        announcement_id,
+        announcement_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.delete(
@@ -83,9 +98,9 @@ def update_announcement_endpoint(
 )
 def delete_announcement_endpoint(
     announcement_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    service_delete_announcement(db, announcement_id, current_user)
+    service_delete_announcement(mongo_db, announcement_id, current_user, sqlite_db=db)
     return MessageResponse(message="Announcement deleted successfully.")
-

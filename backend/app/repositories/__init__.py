@@ -1,0 +1,95 @@
+from app.repositories.assignment_repository import (
+    MongoAssignment,
+    MongoAssignmentSubmission,
+)
+from app.repositories.communication_repository import (
+    MongoCourseAnnouncement,
+    MongoCourseDiscussion,
+    MongoDiscussionReply,
+    MongoEmailDelivery,
+    MongoNotification,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    MongoCourseEnrollment,
+    MongoCourseSection,
+    MongoLesson,
+    MongoLessonProgress,
+)
+from app.repositories.material_repository import MongoLearningMaterial
+from app.repositories.quiz_repository import (
+    MongoAnswerOption,
+    MongoQuestion,
+    MongoQuiz,
+    MongoQuizAttempt,
+    MongoQuizAttemptAnswer,
+)
+from app.repositories.ai_repository import (
+    MongoAIConversation,
+    MongoAIMessage,
+    MongoAIQuiz,
+    MongoAIQuizAnswer,
+    MongoAIQuizAttempt,
+    MongoAIQuizOption,
+    MongoAIQuizQuestion,
+    MongoStudyDeadline,
+    MongoStudyNotification,
+    MongoStudyPlan,
+    MongoStudyPreference,
+    MongoStudyTask,
+)
+from app.repositories.instructor_ai_repository import (
+    MongoAssignmentEvaluation,
+    MongoAssignmentEvaluationCriterion,
+    MongoAssignmentRubric,
+    MongoEvaluationCriterionRubric,
+    MongoGeneratedQuestion,
+    MongoQuestionPaper,
+)
+from app.repositories.user_repository import (
+    MongoInstructorPasswordToken,
+    MongoInstructorProfile,
+    MongoUser,
+)
+
+__all__ = [
+    "MongoAIConversation",
+    "MongoAIMessage",
+    "MongoAIQuiz",
+    "MongoAIQuizAnswer",
+    "MongoAIQuizAttempt",
+    "MongoAIQuizOption",
+    "MongoAIQuizQuestion",
+    "MongoStudyDeadline",
+    "MongoStudyNotification",
+    "MongoStudyPlan",
+    "MongoStudyPreference",
+    "MongoStudyTask",
+    "MongoAssignmentEvaluation",
+    "MongoAssignmentEvaluationCriterion",
+    "MongoAssignmentRubric",
+    "MongoEvaluationCriterionRubric",
+    "MongoGeneratedQuestion",
+    "MongoQuestionPaper",
+    "MongoCourse",
+    "MongoCourseEnrollment",
+    "MongoCourseSection",
+    "MongoLesson",
+    "MongoLessonProgress",
+    "MongoQuiz",
+    "MongoQuestion",
+    "MongoAnswerOption",
+    "MongoQuizAttempt",
+    "MongoQuizAttemptAnswer",
+    "MongoAssignment",
+    "MongoAssignmentSubmission",
+    "MongoLearningMaterial",
+    "MongoCourseAnnouncement",
+    "MongoCourseDiscussion",
+    "MongoDiscussionReply",
+    "MongoNotification",
+    "MongoEmailDelivery",
+    "MongoUser",
+    "MongoInstructorProfile",
+    "MongoInstructorPasswordToken",
+]

@@ -9,7 +9,7 @@ class InstructorCreate(BaseModel):
 
     full_name: str = Field(min_length=2, max_length=100)
     email: EmailStr
-    phone_number: str = Field(min_length=7, max_length=30, pattern=r"^[+()0-9\s.-]+$")
+    phone_number: str = Field(min_length=7, max_length=30, pattern=r"^[0-9]+$")
     qualification: str = Field(min_length=2, max_length=150)
     department: str = Field(min_length=2, max_length=150)
     subject_expertise: str = Field(min_length=2, max_length=255)
@@ -30,7 +30,7 @@ class InstructorUpdate(BaseModel):
         default=None,
         min_length=7,
         max_length=30,
-        pattern=r"^[+()0-9\s.-]+$",
+        pattern=r"^[0-9]+$",
     )
     qualification: Optional[str] = Field(default=None, min_length=2, max_length=150)
     department: Optional[str] = Field(default=None, min_length=2, max_length=150)

@@ -1,19 +1,44 @@
+import hashlib
 import logging
 import secrets
 import smtplib
 from datetime import datetime, timedelta, timezone
-import hashlib
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
+from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.dependencies import get_db, require_admin
-from app.models.course import Course
-from app.models.instructor import InstructorPasswordToken, InstructorProfile
-from app.models.user import User, UserRole
+from app.dependencies import get_db, get_mongo_db, require_admin
+from app.models.user import UserRole
+from app.repositories.course_repository import (
+    get_course_by_id,
+    instructor_has_courses,
+    restore_course_snapshot,
+    sync_course_to_sqlite_shadow,
+    update_course_doc,
+)
+from app.repositories.user_repository import (
+    MongoInstructorProfile,
+    MongoUser,
+    allocate_instructor_code,
+    create_instructor_profile,
+    create_password_token,
+    create_user,
+    delete_user_by_id,
+    delete_user_from_sqlite_shadow,
+    email_exists_for_other_user,
+    get_instructor_profile_by_user_id,
+    get_user_by_email,
+    get_user_by_id,
+    list_instructors_filtered,
+    normalize_email,
+    sync_or_rollback_user_shadow,
+    sync_user_to_sqlite_shadow,
+    update_instructor_profile_fields,
+    update_user_fields,
+)
 from app.schemas.common import MessageResponse
 from app.schemas.instructor import (
     CourseInstructorAssignment,
@@ -35,7 +60,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-def _serialize_instructor(user: User, profile: InstructorProfile) -> InstructorResponse:
+def _serialize_instructor(user: MongoUser, profile: MongoInstructorProfile) -> InstructorResponse:
     return InstructorResponse(
         user_id=user.id,
         instructor_id=profile.instructor_id,
@@ -52,44 +77,25 @@ def _serialize_instructor(user: User, profile: InstructorProfile) -> InstructorR
     )
 
 
-def _new_instructor_id(db: Session) -> str:
-    for _ in range(5):
-        candidate = f"EV-I-{secrets.token_hex(4).upper()}"
-        if not db.query(InstructorProfile.id).filter(
-            InstructorProfile.instructor_id == candidate
-        ).first():
-            return candidate
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Unable to allocate an instructor ID. Please try again.",
-    )
-
-
 def _issue_password_link(
-    db: Session,
-    user: User,
+    mongo_db: Database,
+    user: MongoUser,
     purpose: str,
 ) -> str:
-    db.query(InstructorPasswordToken).filter(
-        InstructorPasswordToken.user_id == user.id,
-        InstructorPasswordToken.purpose == purpose,
-        InstructorPasswordToken.used_at.is_(None),
-    ).update({"used_at": datetime.now(timezone.utc)}, synchronize_session=False)
     raw_token = secrets.token_urlsafe(40)
-    db.add(
-        InstructorPasswordToken(
-            user_id=user.id,
-            token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
-            purpose=purpose,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
-        )
+    create_password_token(
+        mongo_db,
+        user_id=user.id,
+        token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+        purpose=purpose,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
     )
     return f"{settings.FRONTEND_BASE_URL.rstrip('/')}/instructor/setup-password?token={raw_token}"
 
 
 def _send_password_email(
-    user: User,
-    profile: InstructorProfile,
+    user: MongoUser,
+    profile: MongoInstructorProfile,
     setup_link: str,
     purpose: str,
 ) -> str:
@@ -104,7 +110,7 @@ def _send_password_email(
         return "failed"
 
 
-def _send_status_email(user: User, profile: InstructorProfile) -> str:
+def _send_status_email(user: MongoUser, profile: MongoInstructorProfile) -> str:
     try:
         send_instructor_status_email(user, profile, settings)
         return "sent"
@@ -125,29 +131,16 @@ def list_instructors(
     search: Optional[str] = Query(default=None, max_length=100),
     department: Optional[str] = Query(default=None, max_length=150),
     is_active: Optional[bool] = None,
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    query = (
-        db.query(User, InstructorProfile)
-        .join(InstructorProfile, InstructorProfile.user_id == User.id)
-        .filter(User.role == UserRole.INSTRUCTOR.value)
+    pairs = list_instructors_filtered(
+        mongo_db,
+        search=search,
+        department=department,
+        is_active=is_active,
     )
-    if search:
-        pattern = f"%{search.strip()}%"
-        query = query.filter(
-            (User.full_name.ilike(pattern))
-            | (InstructorProfile.instructor_id.ilike(pattern))
-            | (User.email.ilike(pattern))
-        )
-    if department:
-        query = query.filter(InstructorProfile.department.ilike(f"%{department.strip()}%"))
-    if is_active is not None:
-        query = query.filter(User.is_active == is_active)
-    return [
-        _serialize_instructor(user, profile)
-        for user, profile in query.order_by(InstructorProfile.registered_at.desc()).all()
-    ]
+    return [_serialize_instructor(user, profile) for user, profile in pairs]
 
 
 @router.post(
@@ -158,47 +151,44 @@ def list_instructors(
 )
 def create_instructor(
     payload: InstructorCreate,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    normalized_email = str(payload.email).strip().lower()
-    if db.query(User.id).filter(User.email.ilike(normalized_email)).first():
+    normalized_email = normalize_email(str(payload.email))
+    if get_user_by_email(mongo_db, normalized_email):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email address already exists.",
         )
 
-    user = User(
+    user = create_user(
+        mongo_db,
         full_name=payload.full_name.strip(),
         email=normalized_email,
         password_hash=hash_password(secrets.token_urlsafe(32)),
         role=UserRole.INSTRUCTOR.value,
         is_active=True,
     )
-    profile = InstructorProfile(
-        instructor_id=_new_instructor_id(db),
-        phone_number=payload.phone_number.strip(),
-        qualification=payload.qualification.strip(),
-        department=payload.department.strip(),
-        subject_expertise=payload.subject_expertise.strip(),
-        experience_years=payload.experience_years,
-        profile_photo_url=payload.profile_photo_url.strip() if payload.profile_photo_url else None,
-    )
-    user.instructor_profile = profile
-    db.add(user)
     try:
-        db.flush()
-        setup_link = _issue_password_link(db, user, "setup")
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        logger.info("Instructor account creation conflicted with a unique database constraint.")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The email address or generated instructor ID is already in use. Please try again.",
-        ) from exc
-    db.refresh(user)
-    db.refresh(profile)
+        profile = create_instructor_profile(
+            mongo_db,
+            user_id=user.id,
+            instructor_id=allocate_instructor_code(mongo_db),
+            phone_number=payload.phone_number.strip(),
+            qualification=payload.qualification.strip(),
+            department=payload.department.strip(),
+            subject_expertise=payload.subject_expertise.strip(),
+            experience_years=payload.experience_years,
+            profile_photo_url=payload.profile_photo_url.strip() if payload.profile_photo_url else None,
+            registered_at=user.created_at,
+        )
+        setup_link = _issue_password_link(mongo_db, user, "setup")
+        sync_user_to_sqlite_shadow(db, user, profile=profile)
+    except Exception:
+        delete_user_by_id(mongo_db, user.id)
+        raise
+
     email_status = _send_password_email(user, profile, setup_link, "setup")
     response = _serialize_instructor(user, profile)
     return InstructorCreatedResponse(
@@ -214,18 +204,14 @@ def create_instructor(
 )
 def get_instructor(
     user_id: int,
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    record = (
-        db.query(User, InstructorProfile)
-        .join(InstructorProfile, InstructorProfile.user_id == User.id)
-        .filter(User.id == user_id, User.role == UserRole.INSTRUCTOR.value)
-        .first()
-    )
-    if not record:
+    user = get_user_by_id(mongo_db, user_id)
+    profile = get_instructor_profile_by_user_id(mongo_db, user_id) if user else None
+    if not user or user.role != UserRole.INSTRUCTOR.value or not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
-    return _serialize_instructor(*record)
+    return _serialize_instructor(user, profile)
 
 
 @router.put(
@@ -236,44 +222,46 @@ def get_instructor(
 def update_instructor(
     user_id: int,
     payload: InstructorUpdate,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id, User.role == UserRole.INSTRUCTOR.value).first()
-    if not user or not user.instructor_profile:
+    user = get_user_by_id(mongo_db, user_id)
+    profile = get_instructor_profile_by_user_id(mongo_db, user_id) if user else None
+    if not user or user.role != UserRole.INSTRUCTOR.value or not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
 
     updates = payload.model_dump(exclude_unset=True)
+    user_updates: dict = {}
     if "email" in updates and updates["email"] is not None:
-        normalized_email = str(updates["email"]).strip().lower()
-        duplicate = db.query(User.id).filter(
-            User.email.ilike(normalized_email),
-            User.id != user.id,
-        ).first()
-        if duplicate:
+        normalized_email = normalize_email(str(updates["email"]))
+        if email_exists_for_other_user(mongo_db, normalized_email, exclude_user_id=user.id):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account with this email address already exists.",
             )
-        user.email = normalized_email
+        user_updates["email"] = normalized_email
     if "full_name" in updates and updates["full_name"] is not None:
-        user.full_name = updates.pop("full_name").strip()
+        user_updates["full_name"] = updates.pop("full_name").strip()
     else:
         updates.pop("full_name", None)
     updates.pop("email", None)
-    for field, value in updates.items():
-        setattr(user.instructor_profile, field, value.strip() if isinstance(value, str) else value)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The email address is already in use.",
-        ) from exc
-    db.refresh(user)
-    db.refresh(user.instructor_profile)
-    return _serialize_instructor(user, user.instructor_profile)
+
+    profile_updates = {
+        field: value.strip() if isinstance(value, str) else value
+        for field, value in updates.items()
+    }
+    updated_user = update_user_fields(mongo_db, user.id, user_updates) if user_updates else user
+    updated_profile = (
+        update_instructor_profile_fields(mongo_db, user.id, profile_updates)
+        if profile_updates
+        else profile
+    )
+    if updated_user is None or updated_profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
+
+    sync_or_rollback_user_shadow(mongo_db, db, user, updated_user, profile=updated_profile)
+    return _serialize_instructor(updated_user, updated_profile)
 
 
 @router.patch(
@@ -284,18 +272,23 @@ def update_instructor(
 def update_instructor_status(
     user_id: int,
     payload: InstructorStatusUpdate,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id, User.role == UserRole.INSTRUCTOR.value).first()
-    if not user or not user.instructor_profile:
+    user = get_user_by_id(mongo_db, user_id)
+    profile = get_instructor_profile_by_user_id(mongo_db, user_id) if user else None
+    if not user or user.role != UserRole.INSTRUCTOR.value or not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
+
     changed = user.is_active != payload.is_active
-    user.is_active = payload.is_active
-    db.commit()
-    db.refresh(user)
-    email_status = _send_status_email(user, user.instructor_profile) if changed else "not_needed"
-    response = _serialize_instructor(user, user.instructor_profile)
+    updated_user = update_user_fields(mongo_db, user.id, {"is_active": payload.is_active})
+    if updated_user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
+
+    sync_or_rollback_user_shadow(mongo_db, db, user, updated_user, profile=profile)
+    email_status = _send_status_email(updated_user, profile) if changed else "not_needed"
+    response = _serialize_instructor(updated_user, profile)
     return InstructorCreatedResponse(
         **response.model_dump(),
         email_delivery_status=email_status,
@@ -309,20 +302,15 @@ def update_instructor_status(
 )
 def reset_instructor_password(
     user_id: int,
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    user = (
-        db.query(User)
-        .options(joinedload(User.instructor_profile))
-        .filter(User.id == user_id, User.role == UserRole.INSTRUCTOR.value)
-        .first()
-    )
-    if not user or not user.instructor_profile:
+    user = get_user_by_id(mongo_db, user_id)
+    profile = get_instructor_profile_by_user_id(mongo_db, user_id) if user else None
+    if not user or user.role != UserRole.INSTRUCTOR.value or not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
-    setup_link = _issue_password_link(db, user, "reset")
-    db.commit()
-    email_status = _send_password_email(user, user.instructor_profile, setup_link, "reset")
+    setup_link = _issue_password_link(mongo_db, user, "reset")
+    email_status = _send_password_email(user, profile, setup_link, "reset")
     return MessageResponse(message=f"Password reset email status: {email_status}.")
 
 
@@ -333,19 +321,21 @@ def reset_instructor_password(
 )
 def delete_instructor(
     user_id: int,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id, User.role == UserRole.INSTRUCTOR.value).first()
-    if not user or not user.instructor_profile:
+    user = get_user_by_id(mongo_db, user_id)
+    profile = get_instructor_profile_by_user_id(mongo_db, user_id) if user else None
+    if not user or user.role != UserRole.INSTRUCTOR.value or not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor not found.")
-    if db.query(Course.id).filter(Course.instructor_id == user_id).first():
+    if instructor_has_courses(mongo_db, user_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Reassign this instructor's courses before deleting the account.",
         )
-    db.delete(user)
-    db.commit()
+    delete_user_by_id(mongo_db, user_id)
+    delete_user_from_sqlite_shadow(db, user_id)
     return MessageResponse(message="Instructor account deleted.")
 
 
@@ -357,29 +347,39 @@ def delete_instructor(
 def assign_course_instructor(
     course_id: int,
     assignment: CourseInstructorAssignment,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
-    instructor = (
-        db.query(User)
-        .join(InstructorProfile, InstructorProfile.user_id == User.id)
-        .filter(
-            User.id == assignment.instructor_user_id,
-            User.role == UserRole.INSTRUCTOR.value,
-            User.is_active.is_(True),
-        )
-        .first()
+    instructor = get_user_by_id(mongo_db, assignment.instructor_user_id)
+    profile = (
+        get_instructor_profile_by_user_id(mongo_db, instructor.id)
+        if instructor
+        else None
     )
-    if not instructor:
+    if (
+        not instructor
+        or not profile
+        or instructor.role != UserRole.INSTRUCTOR.value
+        or not instructor.is_active
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Active registered instructor not found.",
         )
-    course.instructor_id = instructor.id
-    db.commit()
+    updated_course = update_course_doc(mongo_db, course.id, {"instructor_id": instructor.id})
+    if not updated_course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    try:
+        sync_user_to_sqlite_shadow(db, instructor, profile=profile)
+        sync_course_to_sqlite_shadow(db, updated_course)
+    except Exception:
+        restore_course_snapshot(mongo_db, course)
+        raise
+    return MessageResponse(message="Course assigned to instructor.")
     return MessageResponse(message="Course assigned to instructor.")
 
 

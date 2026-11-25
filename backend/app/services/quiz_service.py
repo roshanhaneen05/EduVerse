@@ -1,19 +1,53 @@
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func
+from pymongo.database import Database
+from sqlalchemy.orm import Session
 
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.quiz import (
-    AnswerOption,
-    Question,
-    Quiz,
-    QuizAttempt,
-    QuizAttemptAnswer,
+from app.repositories.course_repository import (
+    MongoCourse,
+    get_course_by_id,
+    get_enrollment_by_student_and_course,
+    get_lesson_by_id,
+    get_section_by_id,
 )
-from app.models.user import User
+from app.repositories.quiz_repository import (
+    MongoAnswerOption,
+    MongoQuestion,
+    MongoQuiz,
+    count_all_attempts_by_quiz_ids,
+    count_completed_attempts_for_student_quiz,
+    create_question_with_options_doc,
+    create_quiz_attempt_doc,
+    create_quiz_doc,
+    delete_question_cascade_mongo,
+    delete_question_from_sqlite_shadow,
+    delete_quiz_attempt_doc,
+    delete_quiz_cascade_mongo,
+    delete_quiz_from_sqlite_shadow,
+    get_latest_unfinished_attempt,
+    get_question_by_id,
+    get_quiz_attempt_by_id,
+    get_quiz_by_id,
+    get_quizzes_by_ids,
+    list_attempt_answers,
+    list_completed_attempts_for_student,
+    list_completed_attempts_for_student_quiz,
+    list_options_for_question_ids,
+    list_questions_for_quiz,
+    list_quizzes_for_course,
+    replace_attempt_answers_docs,
+    replace_question_and_options_doc,
+    restore_question_snapshot,
+    restore_quiz_attempt_snapshot,
+    restore_quiz_snapshot,
+    sync_question_to_sqlite_shadow,
+    sync_quiz_attempt_to_sqlite_shadow,
+    sync_quiz_to_sqlite_shadow,
+    update_quiz_attempt_doc,
+    update_quiz_doc,
+)
+from app.repositories.user_repository import MongoUser
 from app.schemas.quiz import (
     AnswerOptionDetail,
     AnswerOptionResponse,
@@ -33,7 +67,7 @@ from app.schemas.quiz import (
 )
 
 
-def _check_course_instructor_or_admin(course: Course, user: User) -> None:
+def _check_course_instructor_or_admin(course: MongoCourse, user: MongoUser) -> None:
     """Ensure user is course instructor or system administrator."""
     if user.role == "admin":
         return
@@ -44,10 +78,46 @@ def _check_course_instructor_or_admin(course: Course, user: User) -> None:
         )
 
 
-def _build_quiz_detail(quiz: Quiz, total_attempts: int = 0) -> QuizDetail:
-    """Helper to convert Quiz model to QuizDetail with full questions & options."""
+def _validate_quiz_course_links(
+    mongo_db: Database,
+    course_id: int,
+    section_id: Optional[int],
+    lesson_id: Optional[int],
+) -> None:
+    if section_id is not None and section_id > 0:
+        sec = get_section_by_id(mongo_db, section_id)
+        if not sec or sec.course_id != course_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Section does not exist or does not belong to this course.",
+            )
+    if lesson_id is not None and lesson_id > 0:
+        les = get_lesson_by_id(mongo_db, lesson_id)
+        if not les or les.course_id != course_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Lesson does not exist or does not belong to this course.",
+            )
+
+
+def _load_questions_and_options(
+    mongo_db: Database,
+    quiz_id: int,
+) -> tuple[List[MongoQuestion], Dict[int, List[MongoAnswerOption]]]:
+    questions = list_questions_for_quiz(mongo_db, quiz_id)
+    options_map = list_options_for_question_ids(mongo_db, [q.id for q in questions])
+    return questions, options_map
+
+
+def _build_quiz_detail(
+    quiz: MongoQuiz,
+    questions: List[MongoQuestion],
+    options_map: Dict[int, List[MongoAnswerOption]],
+    total_attempts: int = 0,
+) -> QuizDetail:
+    """Convert MongoQuiz + questions + options to QuizDetail with answer keys."""
     questions_detail = []
-    for q in sorted(quiz.questions, key=lambda x: x.order_index):
+    for q in sorted(questions, key=lambda x: x.order_index):
         opts = [
             AnswerOptionDetail(
                 id=opt.id,
@@ -55,7 +125,7 @@ def _build_quiz_detail(quiz: Quiz, total_attempts: int = 0) -> QuizDetail:
                 option_text=opt.option_text,
                 is_correct=opt.is_correct,
             )
-            for opt in sorted(q.options, key=lambda x: x.id)
+            for opt in sorted(options_map.get(q.id, []), key=lambda x: x.id)
         ]
         questions_detail.append(
             QuestionDetail(
@@ -85,22 +155,13 @@ def _build_quiz_detail(quiz: Quiz, total_attempts: int = 0) -> QuizDetail:
     )
 
 
-def get_quiz_for_student(db: Session, quiz_id: int, user: User) -> QuizResponse:
-    """
-    Fetch quiz and questions for student taking the quiz.
-    CRITICAL SECURITY RULE: Never expose is_correct in student view before submission.
-    """
-    quiz = (
-        db.query(Quiz)
-        .options(
-            joinedload(Quiz.questions).joinedload(Question.options)
-        )
-        .filter(Quiz.id == quiz_id)
-        .first()
-    )
-    if not quiz:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
-
+def _require_student_quiz_access(
+    mongo_db: Database,
+    quiz: MongoQuiz,
+    user: MongoUser,
+    *,
+    action_label: str,
+) -> None:
     is_manager = user.role in ("instructor", "admin")
     if not quiz.is_published and not is_manager:
         raise HTTPException(
@@ -109,46 +170,44 @@ def get_quiz_for_student(db: Session, quiz_id: int, user: User) -> QuizResponse:
         )
 
     if not is_manager:
-        enrollment = (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.student_id == user.id,
-                CourseEnrollment.course_id == quiz.course_id,
-                CourseEnrollment.status == "approved",
-            )
-            .first()
-        )
-        if not enrollment:
+        enrollment = get_enrollment_by_student_and_course(mongo_db, user.id, quiz.course_id)
+        if not enrollment or enrollment.status != "approved":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="You must be enrolled in the course to take this quiz.",
+                detail=f"You must be enrolled in the course to {action_label} this quiz.",
             )
 
-    # Calculate attempts metadata for student
-    completed_attempts = (
-        db.query(QuizAttempt)
-        .filter(
-            QuizAttempt.quiz_id == quiz.id,
-            QuizAttempt.student_id == user.id,
-            QuizAttempt.is_completed == True,
-        )
-        .all()
-    )
+
+def get_quiz_for_student(
+    mongo_db: Database,
+    quiz_id: int,
+    user: MongoUser,
+) -> QuizResponse:
+    """
+    Fetch quiz and questions for student taking the quiz.
+    CRITICAL SECURITY RULE: Never expose is_correct in student view before submission.
+    """
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
+    if not quiz:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
+
+    _require_student_quiz_access(mongo_db, quiz, user, action_label="take")
+
+    completed_attempts = list_completed_attempts_for_student_quiz(mongo_db, quiz.id, user.id)
     attempts_count = len(completed_attempts)
     best_score = max([a.score for a in completed_attempts], default=None)
-    can_attempt = True
-    if quiz.max_attempts > 0 and attempts_count >= quiz.max_attempts:
-        can_attempt = False
+    can_attempt = not (quiz.max_attempts > 0 and attempts_count >= quiz.max_attempts)
 
+    questions, options_map = _load_questions_and_options(mongo_db, quiz.id)
     questions_response = []
-    for q in sorted(quiz.questions, key=lambda x: x.order_index):
+    for q in sorted(questions, key=lambda x: x.order_index):
         options_response = [
             AnswerOptionResponse(
                 id=opt.id,
                 question_id=opt.question_id,
                 option_text=opt.option_text,
             )
-            for opt in sorted(q.options, key=lambda x: x.id)
+            for opt in sorted(options_map.get(q.id, []), key=lambda x: x.id)
         ]
         questions_response.append(
             QuestionResponse(
@@ -181,89 +240,65 @@ def get_quiz_for_student(db: Session, quiz_id: int, user: User) -> QuizResponse:
     )
 
 
-def start_quiz_attempt(db: Session, quiz_id: int, user: User) -> QuizStartResponse:
+def start_quiz_attempt(
+    mongo_db: Database,
+    quiz_id: int,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
+) -> QuizStartResponse:
     """Start an authorized quiz attempt session with timer calculation."""
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
 
-    is_manager = user.role in ("instructor", "admin")
-    if not quiz.is_published and not is_manager:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This assessment is currently in draft mode and not published.",
-        )
+    _require_student_quiz_access(mongo_db, quiz, user, action_label="take")
 
-    if not is_manager:
-        enrollment = db.query(CourseEnrollment).filter(
-            CourseEnrollment.student_id == user.id,
-            CourseEnrollment.course_id == quiz.course_id,
-            CourseEnrollment.status == "approved",
-        ).first()
-        if not enrollment:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You must be enrolled in the course to take this quiz.",
-            )
-
-    completed_count = db.query(QuizAttempt).filter(
-        QuizAttempt.quiz_id == quiz.id,
-        QuizAttempt.student_id == user.id,
-        QuizAttempt.is_completed == True,
-    ).count()
-
+    completed_count = count_completed_attempts_for_student_quiz(mongo_db, quiz.id, user.id)
     if quiz.max_attempts > 0 and completed_count >= quiz.max_attempts:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"You have reached the maximum allowed attempts ({quiz.max_attempts}) for this quiz.",
         )
 
-    # Check for active unfinished attempt
-    active_attempt = db.query(QuizAttempt).filter(
-        QuizAttempt.quiz_id == quiz.id,
-        QuizAttempt.student_id == user.id,
-        QuizAttempt.is_completed == False,
-    ).order_by(QuizAttempt.started_at.desc()).first()
-
+    active_attempt = get_latest_unfinished_attempt(mongo_db, quiz.id, user.id)
     now = datetime.now(timezone.utc)
-    if active_attempt:
-        # Check if time limit expired
-        if quiz.time_limit_minutes:
-            started = active_attempt.started_at.replace(tzinfo=timezone.utc) if active_attempt.started_at.tzinfo is None else active_attempt.started_at
-            elapsed = (now - started).total_seconds()
-            if elapsed > (quiz.time_limit_minutes * 60 + 120):
-                # Auto-close expired attempt
-                active_attempt.is_completed = True
-                active_attempt.submitted_at = now
-                db.commit()
-                completed_count += 1
-                if quiz.max_attempts > 0 and completed_count >= quiz.max_attempts:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Previous attempt expired. Maximum allowed attempts ({quiz.max_attempts}) reached.",
-                    )
-                active_attempt = None
+
+    if active_attempt and quiz.time_limit_minutes:
+        elapsed = (now - active_attempt.started_at).total_seconds()
+        if elapsed > (quiz.time_limit_minutes * 60 + 120):
+            closed = update_quiz_attempt_doc(
+                mongo_db,
+                active_attempt.id,
+                {"is_completed": True, "submitted_at": now},
+            )
+            if closed:
+                sync_quiz_attempt_to_sqlite_shadow(sqlite_db, closed)
+            completed_count += 1
+            if quiz.max_attempts > 0 and completed_count >= quiz.max_attempts:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Previous attempt expired. Maximum allowed attempts ({quiz.max_attempts}) reached.",
+                )
+            active_attempt = None
 
     if not active_attempt:
-        active_attempt = QuizAttempt(
-            student_id=user.id,
+        active_attempt = create_quiz_attempt_doc(
+            mongo_db,
             quiz_id=quiz.id,
-            score=0.0,
-            total_points=0,
-            passed=False,
+            student_id=user.id,
             attempt_number=completed_count + 1,
             is_completed=False,
-            started_at=now,
-            submitted_at=now,
+            now=now,
         )
-        db.add(active_attempt)
-        db.commit()
-        db.refresh(active_attempt)
+        try:
+            sync_quiz_attempt_to_sqlite_shadow(sqlite_db, active_attempt)
+        except Exception:
+            delete_quiz_attempt_doc(mongo_db, active_attempt.id)
+            raise
 
-    started_tz = active_attempt.started_at.replace(tzinfo=timezone.utc) if active_attempt.started_at.tzinfo is None else active_attempt.started_at
     expires_at = None
     if quiz.time_limit_minutes:
-        expires_at = started_tz + timedelta(minutes=quiz.time_limit_minutes)
+        expires_at = active_attempt.started_at + timedelta(minutes=quiz.time_limit_minutes)
 
     return QuizStartResponse(
         attempt_id=active_attempt.id,
@@ -271,51 +306,29 @@ def start_quiz_attempt(db: Session, quiz_id: int, user: User) -> QuizStartRespon
         attempt_number=active_attempt.attempt_number,
         max_attempts=quiz.max_attempts,
         time_limit_minutes=quiz.time_limit_minutes,
-        started_at=started_tz,
+        started_at=active_attempt.started_at,
         expires_at=expires_at,
     )
 
 
 def evaluate_quiz_submission(
-    db: Session,
+    mongo_db: Database,
     quiz_id: int,
-    user: User,
+    user: MongoUser,
     submission: QuizSubmission,
+    sqlite_db: Optional[Session] = None,
 ) -> QuizAttemptResult:
-    """Evaluate quiz on server side and persist attempt."""
-    quiz = (
-        db.query(Quiz)
-        .options(joinedload(Quiz.questions).joinedload(Question.options))
-        .filter(Quiz.id == quiz_id)
-        .first()
-    )
+    """Evaluate quiz on server side and persist attempt in MongoDB."""
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
 
-    is_manager = user.role in ("instructor", "admin")
-    if not quiz.is_published and not is_manager:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This assessment is currently in draft mode and not published.",
-        )
+    _require_student_quiz_access(mongo_db, quiz, user, action_label="submit")
 
-    if not is_manager:
-        enrollment = db.query(CourseEnrollment).filter(
-            CourseEnrollment.student_id == user.id,
-            CourseEnrollment.course_id == quiz.course_id,
-            CourseEnrollment.status == "approved",
-        ).first()
-        if not enrollment:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You must be enrolled in the course to submit this quiz.",
-            )
-
-    questions = quiz.questions
+    questions, options_map = _load_questions_and_options(mongo_db, quiz.id)
     if not questions:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This quiz has no questions.")
 
-    # Normalize answers dictionary
     if isinstance(submission.answers, list):
         answers_dict = {item.question_id: item.selected_option_id for item in submission.answers}
     elif isinstance(submission.answers, dict):
@@ -325,9 +338,11 @@ def evaluate_quiz_submission(
 
     now = datetime.now(timezone.utc)
     attempt = None
+    prev_attempt_snapshot = None
+    created_new_attempt = False
 
     if submission.attempt_id:
-        attempt = db.query(QuizAttempt).filter(QuizAttempt.id == submission.attempt_id).first()
+        attempt = get_quiz_attempt_by_id(mongo_db, submission.attempt_id)
         if not attempt:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz attempt session not found.")
         if attempt.student_id != user.id:
@@ -335,45 +350,39 @@ def evaluate_quiz_submission(
         if attempt.is_completed:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This quiz attempt has already been submitted and graded.")
 
-        # Time limit check
         if quiz.time_limit_minutes:
-            started = attempt.started_at.replace(tzinfo=timezone.utc) if attempt.started_at.tzinfo is None else attempt.started_at
-            elapsed = (now - started).total_seconds()
-            max_allowed = (quiz.time_limit_minutes * 60) + 120  # 2-minute buffer
+            elapsed = (now - attempt.started_at).total_seconds()
+            max_allowed = (quiz.time_limit_minutes * 60) + 120
             if elapsed > max_allowed:
-                attempt.is_completed = True
-                attempt.submitted_at = now
-                db.commit()
+                closed = update_quiz_attempt_doc(
+                    mongo_db,
+                    attempt.id,
+                    {"is_completed": True, "submitted_at": now},
+                )
+                if closed:
+                    sync_quiz_attempt_to_sqlite_shadow(sqlite_db, closed)
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Time limit for this quiz has expired.",
                 )
+        prev_attempt_snapshot = attempt
 
     if not attempt:
-        # Check attempts limit
-        completed_count = db.query(QuizAttempt).filter(
-            QuizAttempt.quiz_id == quiz.id,
-            QuizAttempt.student_id == user.id,
-            QuizAttempt.is_completed == True,
-        ).count()
+        completed_count = count_completed_attempts_for_student_quiz(mongo_db, quiz.id, user.id)
         if quiz.max_attempts > 0 and completed_count >= quiz.max_attempts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"You have reached the maximum allowed attempts ({quiz.max_attempts}) for this quiz.",
             )
-        attempt = QuizAttempt(
-            student_id=user.id,
+        attempt = create_quiz_attempt_doc(
+            mongo_db,
             quiz_id=quiz.id,
-            score=0.0,
-            total_points=0,
-            passed=False,
+            student_id=user.id,
             attempt_number=completed_count + 1,
             is_completed=False,
-            started_at=now,
-            submitted_at=now,
+            now=now,
         )
-        db.add(attempt)
-        db.flush()
+        created_new_attempt = True
 
     points_earned = 0
     total_possible_points = sum(q.points for q in questions)
@@ -382,9 +391,10 @@ def evaluate_quiz_submission(
     review_items = []
 
     for q in sorted(questions, key=lambda x: x.order_index):
+        opts = options_map.get(q.id, [])
         selected_option_id = answers_dict.get(q.id)
-        selected_opt = next((opt for opt in q.options if opt.id == selected_option_id), None)
-        correct_option = next((opt for opt in q.options if opt.is_correct), None)
+        selected_opt = next((opt for opt in opts if opt.id == selected_option_id), None)
+        correct_option = next((opt for opt in opts if opt.is_correct), None)
         correct_option_id = correct_option.id if correct_option else 0
         correct_option_text = correct_option.option_text if correct_option else ""
 
@@ -427,81 +437,82 @@ def evaluate_quiz_submission(
         )
 
     score_percentage = (
-        round((points_earned / total_possible_points) * 100.0, 1) if total_possible_points > 0 else 100.0
+        round((points_earned / total_possible_points) * 100.0, 1)
+        if total_possible_points > 0
+        else 100.0
     )
     passed = score_percentage >= quiz.passing_score
 
-    attempt.score = score_percentage
-    attempt.total_points = total_possible_points
-    attempt.passed = passed
-    attempt.submitted_at = now
-    attempt.is_completed = True
+    updated_attempt = update_quiz_attempt_doc(
+        mongo_db,
+        attempt.id,
+        {
+            "score": score_percentage,
+            "total_points": total_possible_points,
+            "passed": passed,
+            "submitted_at": now,
+            "is_completed": True,
+        },
+    )
+    assert updated_attempt is not None
+    stored_answers = replace_attempt_answers_docs(
+        mongo_db,
+        updated_attempt.id,
+        answers_to_create,
+    )
 
-    # Delete any previous answers if re-evaluating draft
-    db.query(QuizAttemptAnswer).filter(QuizAttemptAnswer.attempt_id == attempt.id).delete()
-
-    for ans in answers_to_create:
-        db_answer = QuizAttemptAnswer(
-            attempt_id=attempt.id,
-            question_id=ans["question_id"],
-            selected_option_id=ans["selected_option_id"],
-            is_correct=ans["is_correct"],
-            awarded_points=ans["awarded_points"],
-        )
-        db.add(db_answer)
-
-    db.commit()
-    db.refresh(attempt)
+    try:
+        sync_quiz_attempt_to_sqlite_shadow(sqlite_db, updated_attempt, stored_answers)
+    except Exception:
+        if created_new_attempt:
+            delete_quiz_attempt_doc(mongo_db, updated_attempt.id)
+        elif prev_attempt_snapshot is not None:
+            restore_quiz_attempt_snapshot(mongo_db, prev_attempt_snapshot)
+        raise
 
     return QuizAttemptResult(
-        id=attempt.id,
-        attempt_id=attempt.id,
+        id=updated_attempt.id,
+        attempt_id=updated_attempt.id,
         quiz_id=quiz.id,
         quiz_title=quiz.title,
         student_id=user.id,
-        attempt_number=attempt.attempt_number,
+        attempt_number=updated_attempt.attempt_number,
         score=score_percentage,
         total_points=total_possible_points,
         total_questions=len(questions),
         passing_score=quiz.passing_score,
         passed=passed,
-        started_at=attempt.started_at,
-        submitted_at=attempt.submitted_at,
+        started_at=updated_attempt.started_at,
+        submitted_at=updated_attempt.submitted_at,
         answers=answers_review,
         questions_review=review_items,
     )
 
 
-def get_attempt_detail(db: Session, attempt_id: int, user: User) -> QuizAttemptResult:
+def get_attempt_detail(
+    mongo_db: Database,
+    attempt_id: int,
+    user: MongoUser,
+) -> QuizAttemptResult:
     """Retrieve private quiz attempt results with authorization check."""
-    attempt = (
-        db.query(QuizAttempt)
-        .options(
-            joinedload(QuizAttempt.quiz).joinedload(Quiz.course),
-            joinedload(QuizAttempt.answers),
-        )
-        .filter(QuizAttempt.id == attempt_id)
-        .first()
-    )
+    attempt = get_quiz_attempt_by_id(mongo_db, attempt_id)
     if not attempt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz attempt not found.")
 
-    course = attempt.quiz.course if attempt.quiz else None
+    quiz = get_quiz_by_id(mongo_db, attempt.quiz_id) if attempt.quiz_id is not None else None
+    course = get_course_by_id(mongo_db, quiz.course_id) if quiz else None
     if user.id != attempt.student_id and user.role != "admin" and (not course or course.instructor_id != user.id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not authorized to view this assessment result.",
         )
 
-    quiz = attempt.quiz
-    questions = (
-        db.query(Question)
-        .options(joinedload(Question.options))
-        .filter(Question.quiz_id == attempt.quiz_id)
-        .order_by(Question.order_index.asc())
-        .all()
+    questions, options_map = (
+        _load_questions_and_options(mongo_db, attempt.quiz_id)
+        if attempt.quiz_id is not None
+        else ([], {})
     )
-    answers_map = {a.question_id: a for a in attempt.answers}
+    answers_map = {a.question_id: a for a in list_attempt_answers(mongo_db, attempt.id)}
 
     answers_review = []
     review_items = []
@@ -511,8 +522,9 @@ def get_attempt_detail(db: Session, attempt_id: int, user: User) -> QuizAttemptR
         is_correct = ans.is_correct if ans else False
         awarded_points = ans.awarded_points if ans else 0
 
-        selected_opt = next((opt for opt in q.options if opt.id == selected_option_id), None)
-        correct_opt = next((opt for opt in q.options if opt.is_correct), None)
+        opts = options_map.get(q.id, [])
+        selected_opt = next((opt for opt in opts if opt.id == selected_option_id), None)
+        correct_opt = next((opt for opt in opts if opt.is_correct), None)
         correct_option_id = correct_opt.id if correct_opt else 0
         correct_option_text = correct_opt.option_text if correct_opt else ""
 
@@ -560,25 +572,21 @@ def get_attempt_detail(db: Session, attempt_id: int, user: User) -> QuizAttemptR
 
 
 def list_user_attempts(
-    db: Session,
+    mongo_db: Database,
     user_id: int,
     quiz_id: Optional[int] = None,
 ) -> List[QuizAttemptSummary]:
-    query = (
-        db.query(QuizAttempt)
-        .options(joinedload(QuizAttempt.quiz))
-        .filter(QuizAttempt.student_id == user_id, QuizAttempt.is_completed == True)
+    attempts = list_completed_attempts_for_student(mongo_db, user_id, quiz_id=quiz_id)
+    quiz_map = get_quizzes_by_ids(
+        mongo_db,
+        [a.quiz_id for a in attempts if a.quiz_id is not None],
     )
-    if quiz_id:
-        query = query.filter(QuizAttempt.quiz_id == quiz_id)
-
-    attempts = query.order_by(QuizAttempt.submitted_at.desc()).all()
     return [
         QuizAttemptSummary(
             id=a.id,
             quiz_id=a.quiz_id,
-            quiz_title=a.quiz.title if a.quiz else "Quiz",
-            course_id=a.quiz.course_id if a.quiz else 0,
+            quiz_title=quiz_map[a.quiz_id].title if a.quiz_id in quiz_map else "Quiz",
+            course_id=quiz_map[a.quiz_id].course_id if a.quiz_id in quiz_map else 0,
             score=a.score,
             total_points=a.total_points,
             passed=a.passed,
@@ -592,218 +600,252 @@ def list_user_attempts(
 # Instructor Quiz Management Service Functions
 # ---------------------------------------------------------------------------
 
+
 def list_quizzes_for_course_instructor(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
-    user: User,
+    user: MongoUser,
 ) -> List[QuizDetail]:
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
-    quizzes = (
-        db.query(Quiz)
-        .options(joinedload(Quiz.questions).joinedload(Question.options))
-        .filter(Quiz.course_id == course_id)
-        .order_by(Quiz.id.asc())
-        .all()
-    )
-
+    quizzes = list_quizzes_for_course(mongo_db, course_id)
+    attempt_counts = count_all_attempts_by_quiz_ids(mongo_db, [q.id for q in quizzes])
     results = []
     for q in quizzes:
-        attempts_count = db.query(func.count(QuizAttempt.id)).filter(QuizAttempt.quiz_id == q.id).scalar() or 0
-        results.append(_build_quiz_detail(q, total_attempts=attempts_count))
+        questions, options_map = _load_questions_and_options(mongo_db, q.id)
+        results.append(
+            _build_quiz_detail(
+                q,
+                questions,
+                options_map,
+                total_attempts=attempt_counts.get(q.id, 0),
+            )
+        )
     return results
 
 
 def get_quiz_detail_for_instructor(
-    db: Session,
+    mongo_db: Database,
     quiz_id: int,
-    user: User,
+    user: MongoUser,
 ) -> QuizDetail:
-    quiz = (
-        db.query(Quiz)
-        .options(joinedload(Quiz.questions).joinedload(Question.options))
-        .filter(Quiz.id == quiz_id)
-        .first()
-    )
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
-    course = db.query(Course).filter(Course.id == quiz.course_id).first()
-    _check_course_instructor_or_admin(course, user)
-
-    attempts_count = db.query(func.count(QuizAttempt.id)).filter(QuizAttempt.quiz_id == quiz.id).scalar() or 0
-    return _build_quiz_detail(quiz, total_attempts=attempts_count)
-
-
-def create_instructor_quiz(
-    db: Session,
-    course_id: int,
-    quiz_in: QuizCreate,
-    user: User,
-) -> QuizDetail:
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, quiz.course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
-    quiz = Quiz(
-        course_id=course_id,
-        section_id=quiz_in.section_id,
-        lesson_id=quiz_in.lesson_id,
-        title=quiz_in.title.strip(),
-        description=quiz_in.description.strip() if quiz_in.description else None,
-        passing_score=quiz_in.passing_score,
-        is_published=quiz_in.is_published,
-        time_limit_minutes=quiz_in.time_limit_minutes,
-        max_attempts=quiz_in.max_attempts,
-    )
-    db.add(quiz)
-    db.flush()
+    questions, options_map = _load_questions_and_options(mongo_db, quiz.id)
+    total_attempts = count_all_attempts_by_quiz_ids(mongo_db, [quiz.id]).get(quiz.id, 0)
+    return _build_quiz_detail(quiz, questions, options_map, total_attempts=total_attempts)
 
-    for q_data in quiz_in.questions:
-        # Validate options: at least 2 options, at least 1 correct
+
+def _validate_questions_payload(questions: List[QuestionCreate]) -> None:
+    for q_data in questions:
         if len(q_data.options) < 2:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Question '{q_data.question_text}' must have at least 2 answer options.",
             )
-        has_correct = any(opt.is_correct for opt in q_data.options)
-        if not has_correct:
+        if not any(opt.is_correct for opt in q_data.options):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Question '{q_data.question_text}' must have at least one marked correct answer option.",
             )
 
-        question = Question(
+
+def create_instructor_quiz(
+    mongo_db: Database,
+    course_id: int,
+    quiz_in: QuizCreate,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
+) -> QuizDetail:
+    course = get_course_by_id(mongo_db, course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    _check_course_instructor_or_admin(course, user)
+
+    _validate_quiz_course_links(
+        mongo_db,
+        course_id,
+        quiz_in.section_id,
+        quiz_in.lesson_id,
+    )
+    _validate_questions_payload(quiz_in.questions)
+
+    quiz = create_quiz_doc(
+        mongo_db,
+        course_id=course_id,
+        section_id=quiz_in.section_id,
+        lesson_id=quiz_in.lesson_id,
+        title=quiz_in.title,
+        description=quiz_in.description,
+        passing_score=quiz_in.passing_score,
+        is_published=quiz_in.is_published,
+        time_limit_minutes=quiz_in.time_limit_minutes,
+        max_attempts=quiz_in.max_attempts,
+        sqlite_db=sqlite_db,
+    )
+    created_q_pairs: List[tuple[MongoQuestion, List[MongoAnswerOption]]] = []
+    for q_data in quiz_in.questions:
+        q_obj, opt_objs = create_question_with_options_doc(
+            mongo_db,
             quiz_id=quiz.id,
-            question_text=q_data.question_text.strip(),
+            question_text=q_data.question_text,
             order_index=q_data.order_index,
             points=q_data.points,
+            options_data=[opt.model_dump() for opt in q_data.options],
+            sqlite_db=sqlite_db,
         )
-        db.add(question)
-        db.flush()
+        created_q_pairs.append((q_obj, opt_objs))
 
-        for opt_data in q_data.options:
-            option = AnswerOption(
-                question_id=question.id,
-                option_text=opt_data.option_text.strip(),
-                is_correct=opt_data.is_correct,
-            )
-            db.add(option)
+    try:
+        sync_quiz_to_sqlite_shadow(sqlite_db, quiz)
+        for q_obj, opt_objs in created_q_pairs:
+            sync_question_to_sqlite_shadow(sqlite_db, q_obj, opt_objs)
+    except Exception:
+        delete_quiz_cascade_mongo(mongo_db, quiz.id)
+        raise
 
-    db.commit()
-    db.refresh(quiz)
-    return _build_quiz_detail(quiz, total_attempts=0)
+    questions = [p[0] for p in created_q_pairs]
+    options_map = {q.id: opts for q, opts in created_q_pairs}
+    return _build_quiz_detail(quiz, questions, options_map, total_attempts=0)
 
 
 def update_instructor_quiz(
-    db: Session,
+    mongo_db: Database,
     quiz_id: int,
     quiz_in: QuizUpdate,
-    user: User,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> QuizDetail:
-    quiz = (
-        db.query(Quiz)
-        .options(joinedload(Quiz.questions).joinedload(Question.options))
-        .filter(Quiz.id == quiz_id)
-        .first()
-    )
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
-    course = db.query(Course).filter(Course.id == quiz.course_id).first()
+    course = get_course_by_id(mongo_db, quiz.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
+    updates: dict = {}
     if quiz_in.title is not None:
-        quiz.title = quiz_in.title.strip()
+        updates["title"] = quiz_in.title.strip()
     if quiz_in.description is not None:
-        quiz.description = quiz_in.description.strip() if quiz_in.description else None
+        updates["description"] = quiz_in.description.strip() if quiz_in.description else None
     if quiz_in.passing_score is not None:
-        quiz.passing_score = quiz_in.passing_score
+        updates["passing_score"] = quiz_in.passing_score
     if quiz_in.is_published is not None:
-        quiz.is_published = quiz_in.is_published
+        updates["is_published"] = quiz_in.is_published
     if quiz_in.time_limit_minutes is not None:
-        quiz.time_limit_minutes = quiz_in.time_limit_minutes
+        updates["time_limit_minutes"] = quiz_in.time_limit_minutes
     if quiz_in.max_attempts is not None:
-        quiz.max_attempts = quiz_in.max_attempts
+        updates["max_attempts"] = quiz_in.max_attempts
     if quiz_in.section_id is not None:
-        quiz.section_id = quiz_in.section_id if quiz_in.section_id > 0 else None
+        if quiz_in.section_id > 0:
+            _validate_quiz_course_links(mongo_db, quiz.course_id, quiz_in.section_id, None)
+            updates["section_id"] = quiz_in.section_id
+        else:
+            updates["section_id"] = None
     if quiz_in.lesson_id is not None:
-        quiz.lesson_id = quiz_in.lesson_id if quiz_in.lesson_id > 0 else None
+        if quiz_in.lesson_id > 0:
+            _validate_quiz_course_links(mongo_db, quiz.course_id, None, quiz_in.lesson_id)
+            updates["lesson_id"] = quiz_in.lesson_id
+        else:
+            updates["lesson_id"] = None
 
-    quiz.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(quiz)
+    updated = update_quiz_doc(mongo_db, quiz.id, updates) if updates else quiz
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
+    try:
+        sync_quiz_to_sqlite_shadow(sqlite_db, updated)
+    except Exception:
+        restore_quiz_snapshot(mongo_db, quiz)
+        raise
 
-    attempts_count = db.query(func.count(QuizAttempt.id)).filter(QuizAttempt.quiz_id == quiz.id).scalar() or 0
-    return _build_quiz_detail(quiz, total_attempts=attempts_count)
+    questions, options_map = _load_questions_and_options(mongo_db, updated.id)
+    attempts_count = count_all_attempts_by_quiz_ids(mongo_db, [updated.id]).get(updated.id, 0)
+    return _build_quiz_detail(updated, questions, options_map, total_attempts=attempts_count)
 
 
 def toggle_publish_quiz(
-    db: Session,
+    mongo_db: Database,
     quiz_id: int,
-    user: User,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> QuizDetail:
-    quiz = (
-        db.query(Quiz)
-        .options(joinedload(Quiz.questions).joinedload(Question.options))
-        .filter(Quiz.id == quiz_id)
-        .first()
-    )
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
-    course = db.query(Course).filter(Course.id == quiz.course_id).first()
+    course = get_course_by_id(mongo_db, quiz.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
+    questions, options_map = _load_questions_and_options(mongo_db, quiz.id)
     target_state = not quiz.is_published
     if target_state:
-        if not quiz.questions:
+        if not questions:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot publish a quiz with no questions. Please add at least one question.",
             )
-        for q in quiz.questions:
-            if not any(opt.is_correct for opt in q.options):
+        for q in questions:
+            if not any(opt.is_correct for opt in options_map.get(q.id, [])):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Question '{q.question_text}' has no correct option selected.",
                 )
 
-    quiz.is_published = target_state
-    quiz.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(quiz)
+    updated = update_quiz_doc(mongo_db, quiz.id, {"is_published": target_state})
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
+    try:
+        sync_quiz_to_sqlite_shadow(sqlite_db, updated)
+    except Exception:
+        restore_quiz_snapshot(mongo_db, quiz)
+        raise
 
-    attempts_count = db.query(func.count(QuizAttempt.id)).filter(QuizAttempt.quiz_id == quiz.id).scalar() or 0
-    return _build_quiz_detail(quiz, total_attempts=attempts_count)
+    attempts_count = count_all_attempts_by_quiz_ids(mongo_db, [updated.id]).get(updated.id, 0)
+    return _build_quiz_detail(updated, questions, options_map, total_attempts=attempts_count)
 
 
 def delete_instructor_quiz(
-    db: Session,
+    mongo_db: Database,
     quiz_id: int,
-    user: User,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> None:
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
-    course = db.query(Course).filter(Course.id == quiz.course_id).first()
+    course = get_course_by_id(mongo_db, quiz.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
-    db.delete(quiz)
-    db.commit()
+    delete_quiz_cascade_mongo(mongo_db, quiz_id)
+    delete_quiz_from_sqlite_shadow(sqlite_db, quiz_id)
 
 
 def add_quiz_question(
-    db: Session,
+    mongo_db: Database,
     quiz_id: int,
     question_in: QuestionCreate,
-    user: User,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> QuestionDetail:
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    quiz = get_quiz_by_id(mongo_db, quiz_id)
     if not quiz:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
-    course = db.query(Course).filter(Course.id == quiz.course_id).first()
+    course = get_course_by_id(mongo_db, quiz.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
     if len(question_in.options) < 2:
@@ -811,25 +853,20 @@ def add_quiz_question(
     if not any(opt.is_correct for opt in question_in.options):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Question must have at least one correct option.")
 
-    question = Question(
+    question, options = create_question_with_options_doc(
+        mongo_db,
         quiz_id=quiz.id,
-        question_text=question_in.question_text.strip(),
+        question_text=question_in.question_text,
         order_index=question_in.order_index,
         points=question_in.points,
+        options_data=[opt.model_dump() for opt in question_in.options],
+        sqlite_db=sqlite_db,
     )
-    db.add(question)
-    db.flush()
-
-    for opt_in in question_in.options:
-        opt = AnswerOption(
-            question_id=question.id,
-            option_text=opt_in.option_text.strip(),
-            is_correct=opt_in.is_correct,
-        )
-        db.add(opt)
-
-    db.commit()
-    db.refresh(question)
+    try:
+        sync_question_to_sqlite_shadow(sqlite_db, question, options)
+    except Exception:
+        delete_question_cascade_mongo(mongo_db, question.id)
+        raise
 
     opts = [
         AnswerOptionDetail(
@@ -838,7 +875,7 @@ def add_quiz_question(
             option_text=o.option_text,
             is_correct=o.is_correct,
         )
-        for o in sorted(question.options, key=lambda x: x.id)
+        for o in sorted(options, key=lambda x: x.id)
     ]
     return QuestionDetail(
         id=question.id,
@@ -851,20 +888,21 @@ def add_quiz_question(
 
 
 def update_quiz_question(
-    db: Session,
+    mongo_db: Database,
     question_id: int,
     question_in: QuestionCreate,
-    user: User,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> QuestionDetail:
-    question = (
-        db.query(Question)
-        .options(joinedload(Question.quiz))
-        .filter(Question.id == question_id)
-        .first()
-    )
+    question = get_question_by_id(mongo_db, question_id)
     if not question:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found.")
-    course = db.query(Course).filter(Course.id == question.quiz.course_id).first()
+    quiz = get_quiz_by_id(mongo_db, question.quiz_id)
+    if not quiz:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
+    course = get_course_by_id(mongo_db, quiz.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
     if len(question_in.options) < 2:
@@ -872,22 +910,25 @@ def update_quiz_question(
     if not any(opt.is_correct for opt in question_in.options):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Question must have at least one correct option.")
 
-    question.question_text = question_in.question_text.strip()
-    question.order_index = question_in.order_index
-    question.points = question_in.points
+    prev_opts = list_options_for_question_ids(mongo_db, [question.id]).get(question.id, [])
+    replaced = replace_question_and_options_doc(
+        mongo_db,
+        question_id=question.id,
+        question_text=question_in.question_text,
+        order_index=question_in.order_index,
+        points=question_in.points,
+        options_data=[opt.model_dump() for opt in question_in.options],
+        sqlite_db=sqlite_db,
+    )
+    if not replaced:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found.")
+    updated_q, new_opts = replaced
 
-    # Replace options
-    db.query(AnswerOption).filter(AnswerOption.question_id == question.id).delete()
-    for opt_in in question_in.options:
-        opt = AnswerOption(
-            question_id=question.id,
-            option_text=opt_in.option_text.strip(),
-            is_correct=opt_in.is_correct,
-        )
-        db.add(opt)
-
-    db.commit()
-    db.refresh(question)
+    try:
+        sync_question_to_sqlite_shadow(sqlite_db, updated_q, new_opts)
+    except Exception:
+        restore_question_snapshot(mongo_db, question, prev_opts)
+        raise
 
     opts = [
         AnswerOptionDetail(
@@ -896,33 +937,34 @@ def update_quiz_question(
             option_text=o.option_text,
             is_correct=o.is_correct,
         )
-        for o in sorted(question.options, key=lambda x: x.id)
+        for o in sorted(new_opts, key=lambda x: x.id)
     ]
     return QuestionDetail(
-        id=question.id,
-        quiz_id=question.quiz_id,
-        question_text=question.question_text,
-        order_index=question.order_index,
-        points=question.points,
+        id=updated_q.id,
+        quiz_id=updated_q.quiz_id,
+        question_text=updated_q.question_text,
+        order_index=updated_q.order_index,
+        points=updated_q.points,
         options=opts,
     )
 
 
 def delete_quiz_question(
-    db: Session,
+    mongo_db: Database,
     question_id: int,
-    user: User,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> None:
-    question = (
-        db.query(Question)
-        .options(joinedload(Question.quiz))
-        .filter(Question.id == question_id)
-        .first()
-    )
+    question = get_question_by_id(mongo_db, question_id)
     if not question:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found.")
-    course = db.query(Course).filter(Course.id == question.quiz.course_id).first()
+    quiz = get_quiz_by_id(mongo_db, question.quiz_id)
+    if not quiz:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quiz not found.")
+    course = get_course_by_id(mongo_db, quiz.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_instructor_or_admin(course, user)
 
-    db.delete(question)
-    db.commit()
+    delete_question_cascade_mongo(mongo_db, question_id)
+    delete_question_from_sqlite_shadow(sqlite_db, question_id)

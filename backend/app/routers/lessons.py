@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db
+from app.repositories.user_repository import MongoUser
 from app.schemas.lesson import LessonProgressResponse, LessonResponse
 from app.services.lesson_service import get_lesson_for_user, mark_lesson_complete
 
@@ -16,10 +17,10 @@ router = APIRouter(prefix="/lessons", tags=["Lessons & Learning"])
 )
 def get_lesson(
     lesson_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_lesson_for_user(db, lesson_id, current_user)
+    return get_lesson_for_user(mongo_db, lesson_id, current_user)
 
 
 @router.post(
@@ -29,8 +30,8 @@ def get_lesson(
 )
 def complete_lesson(
     lesson_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return mark_lesson_complete(db, lesson_id, current_user)
-
+    return mark_lesson_complete(mongo_db, lesson_id, current_user, sqlite_db=db)

@@ -1,16 +1,28 @@
 from datetime import datetime, timezone
-import math
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import HTTPException, status
-from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
 
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.quiz import Quiz, QuizAttempt
-from app.models.user import User
+from app.repositories.assignment_repository import (
+    list_assignments_by_course_ids,
+    list_submissions_for_student_assignments,
+)
+from app.repositories.course_repository import (
+    get_course_by_id,
+    get_courses_by_ids,
+    get_enrollment_by_student_and_course,
+    get_lessons_by_ids,
+    list_all_courses,
+    list_enrollments,
+    list_lesson_progress,
+    list_lessons_by_course_ids,
+    list_lessons_for_course,
+)
+from app.repositories.quiz_repository import (
+    get_quiz_by_id,
+    list_quiz_attempts,
+)
+from app.repositories.user_repository import get_users_by_ids
 from app.schemas.course import CourseResponse
 from app.schemas.student import (
     ContinueLearningResponse,
@@ -27,7 +39,7 @@ from app.services.course_service import enrich_course_response
 
 
 def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """Ensures datetime is timezone-aware UTC for safe comparisons in SQLite."""
+    """Ensures datetime is timezone-aware UTC for safe comparisons."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -36,7 +48,7 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 def get_continue_learning_lesson(
-    db: Session, student_id: int, course_id: int
+    mongo_db: Database, student_id: int, course_id: int
 ) -> ContinueLearningResponse:
     """
     Finds the exact next lesson for a student in a course:
@@ -45,35 +57,21 @@ def get_continue_learning_lesson(
     3. If all lessons are completed, return the first lesson for review.
     4. If no lessons exist in the course, return None with reason 'no_lessons'.
     """
-    enrollment = (
-        db.query(CourseEnrollment)
-        .filter(
-            CourseEnrollment.student_id == student_id,
-            CourseEnrollment.course_id == course_id,
-            CourseEnrollment.status == "approved",
-        )
-        .first()
-    )
-    if not enrollment:
+    enrollment = get_enrollment_by_student_and_course(mongo_db, student_id, course_id)
+    if not enrollment or enrollment.status != "approved":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not enrolled in this course.",
         )
 
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found.",
         )
 
-    lessons = (
-        db.query(Lesson)
-        .filter(Lesson.course_id == course_id)
-        .order_by(Lesson.order_index.asc(), Lesson.id.asc())
-        .all()
-    )
-
+    lessons = list_lessons_for_course(mongo_db, course_id)
     if not lessons:
         return ContinueLearningResponse(
             course_id=course.id,
@@ -85,19 +83,13 @@ def get_continue_learning_lesson(
         )
 
     lesson_ids = [l.id for l in lessons]
-    progress_records = (
-        db.query(LessonProgress)
-        .filter(
-            LessonProgress.student_id == student_id,
-            LessonProgress.lesson_id.in_(lesson_ids),
-        )
-        .all()
+    progress_records = list_lesson_progress(
+        mongo_db, student_id=student_id, lesson_ids=lesson_ids
     )
     completed_ids = {p.lesson_id for p in progress_records if p.is_completed}
     incomplete_lessons = [l for l in lessons if l.id not in completed_ids]
 
     if not incomplete_lessons:
-        # All lessons are completed
         first_lesson = lessons[0]
         return ContinueLearningResponse(
             course_id=course.id,
@@ -108,12 +100,12 @@ def get_continue_learning_lesson(
             reason="course_completed_first_lesson",
         )
 
-    # Check if there is an in-progress lesson that was recently updated
-    in_progress_records = [
-        p for p in progress_records if not p.is_completed
-    ]
+    in_progress_records = [p for p in progress_records if not p.is_completed]
     if in_progress_records:
-        in_progress_records.sort(key=lambda p: p.updated_at, reverse=True)
+        in_progress_records.sort(
+            key=lambda p: _ensure_utc(p.updated_at) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
         active_lesson_id = in_progress_records[0].lesson_id
         active_lesson = next((l for l in lessons if l.id == active_lesson_id), None)
         if active_lesson:
@@ -126,7 +118,6 @@ def get_continue_learning_lesson(
                 reason="latest_progress",
             )
 
-    # Otherwise, pick the first incomplete lesson by order_index
     target = incomplete_lessons[0]
     return ContinueLearningResponse(
         course_id=course.id,
@@ -139,61 +130,46 @@ def get_continue_learning_lesson(
 
 
 def list_student_enrolled_courses(
-    db: Session, student_id: int, status_filter: Optional[str] = None
+    mongo_db: Database, student_id: int, status_filter: Optional[str] = None
 ) -> List[EnrolledCourseDetail]:
     """
     Returns the student's enrolled courses with progress breakdown,
     completed/remaining lesson counts, and next lesson action.
     """
-    enrollments = (
-        db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.course).joinedload(Course.instructor))
-        .filter(CourseEnrollment.student_id == student_id)
-        .order_by(CourseEnrollment.enrolled_at.desc())
-        .all()
-    )
-
+    enrollments = list_enrollments(mongo_db, student_id=student_id, sort_desc=True)
     if not enrollments:
         return []
 
     course_ids = [e.course_id for e in enrollments]
+    courses_map = get_courses_by_ids(mongo_db, course_ids)
+    instructor_ids = [c.instructor_id for c in courses_map.values()]
+    instructors_map = get_users_by_ids(mongo_db, instructor_ids)
 
-    # Batch lesson counts per course
-    lesson_counts = dict(
-        db.query(Lesson.course_id, func.count(Lesson.id))
-        .filter(Lesson.course_id.in_(course_ids))
-        .group_by(Lesson.course_id)
-        .all()
-    )
+    lessons_all = list_lessons_by_course_ids(mongo_db, course_ids)
+    lesson_counts: Dict[int, int] = {}
+    lesson_to_course: Dict[int, int] = {}
+    for lesson in lessons_all:
+        lesson_counts[lesson.course_id] = lesson_counts.get(lesson.course_id, 0) + 1
+        lesson_to_course[lesson.id] = lesson.course_id
 
-    # Batch completed lesson counts per course for this student
-    completed_counts = dict(
-        db.query(Lesson.course_id, func.count(LessonProgress.id))
-        .join(LessonProgress, Lesson.id == LessonProgress.lesson_id)
-        .filter(
-            LessonProgress.student_id == student_id,
-            Lesson.course_id.in_(course_ids),
-            LessonProgress.is_completed == True,
-        )
-        .group_by(Lesson.course_id)
-        .all()
+    progress_all = list_lesson_progress(
+        mongo_db, student_id=student_id, lesson_ids=list(lesson_to_course.keys())
     )
-
-    # Batch last accessed timestamp per course
-    last_accessed_times = dict(
-        db.query(Lesson.course_id, func.max(LessonProgress.updated_at))
-        .join(LessonProgress, Lesson.id == LessonProgress.lesson_id)
-        .filter(
-            LessonProgress.student_id == student_id,
-            Lesson.course_id.in_(course_ids),
-        )
-        .group_by(Lesson.course_id)
-        .all()
-    )
+    completed_counts: Dict[int, int] = {}
+    last_accessed_times: Dict[int, datetime] = {}
+    for lp in progress_all:
+        cid = lesson_to_course.get(lp.lesson_id)
+        if cid is None:
+            continue
+        if lp.is_completed:
+            completed_counts[cid] = completed_counts.get(cid, 0) + 1
+        ts = _ensure_utc(lp.updated_at)
+        if ts and (cid not in last_accessed_times or ts > last_accessed_times[cid]):
+            last_accessed_times[cid] = ts
 
     results: List[EnrolledCourseDetail] = []
     for enr in enrollments:
-        c = enr.course
+        c = courses_map.get(enr.course_id)
         if not c:
             continue
 
@@ -202,9 +178,8 @@ def list_student_enrolled_courses(
         rem_lessons = max(0, tot_lessons - comp_lessons)
         last_accessed = last_accessed_times.get(c.id) or enr.enrolled_at
 
-        # Determine next lesson helper
         try:
-            cont = get_continue_learning_lesson(db, student_id, c.id)
+            cont = get_continue_learning_lesson(mongo_db, student_id, c.id)
             next_id = cont.next_lesson_id
             next_title = cont.next_lesson_title
         except HTTPException:
@@ -212,12 +187,12 @@ def list_student_enrolled_courses(
             next_title = None
 
         status_val = "completed" if enr.completion_percentage >= 100.0 else "in_progress"
-
         if status_filter and status_filter.lower() != "all" and status_val != status_filter.lower():
             continue
 
-        inst_name = c.instructor.full_name if c.instructor else "EduVerse Faculty"
-        inst_email = c.instructor.email if c.instructor else "faculty@eduverse.io"
+        instructor = instructors_map.get(c.instructor_id)
+        inst_name = instructor.full_name if instructor else "EduVerse Faculty"
+        inst_email = instructor.email if instructor else "faculty@eduverse.io"
 
         results.append(
             EnrolledCourseDetail(
@@ -245,49 +220,38 @@ def list_student_enrolled_courses(
 
 
 def list_student_assignments(
-    db: Session, student_id: int, filter_status: Optional[str] = None
+    mongo_db: Database, student_id: int, filter_status: Optional[str] = None
 ) -> List[StudentAssignmentOverviewItem]:
     """
     Retrieves all assignments across enrolled courses with personal submission status,
     grades, deadlines, and instructor feedback.
     """
-    enrolled_courses = (
-        db.query(CourseEnrollment.course_id)
-        .filter(
-            CourseEnrollment.student_id == student_id,
-            CourseEnrollment.status == "approved",
-        )
-        .all()
+    enrollments = list_enrollments(
+        mongo_db, student_id=student_id, status_filter="approved"
     )
-    enrolled_ids = [e[0] for e in enrolled_courses]
+    enrolled_ids = [e.course_id for e in enrollments]
     if not enrolled_ids:
         return []
 
-    assignments = (
-        db.query(Assignment)
-        .options(joinedload(Assignment.course))
-        .filter(
-            Assignment.course_id.in_(enrolled_ids),
-            Assignment.is_published == True,
-            Assignment.is_archived == False,
-        )
-        .order_by(Assignment.due_date.asc().nullslast(), Assignment.id.asc())
-        .all()
+    courses_map = get_courses_by_ids(mongo_db, enrolled_ids)
+    assignments = list_assignments_by_course_ids(
+        mongo_db, enrolled_ids, published_only=True, exclude_archived=True
     )
-
     if not assignments:
         return []
 
-    assignment_ids = [a.id for a in assignments]
-    submissions = (
-        db.query(AssignmentSubmission)
-        .filter(
-            AssignmentSubmission.student_id == student_id,
-            AssignmentSubmission.assignment_id.in_(assignment_ids),
+    # Sort due_date ascending with None last, then id ascending
+    assignments.sort(
+        key=lambda a: (
+            1 if a.due_date is None else 0,
+            _ensure_utc(a.due_date) or datetime.max.replace(tzinfo=timezone.utc),
+            a.id,
         )
-        .all()
     )
-    sub_map = {s.assignment_id: s for s in submissions}
+
+    sub_map = list_submissions_for_student_assignments(
+        mongo_db, student_id, [a.id for a in assignments]
+    )
 
     now_utc = datetime.now(timezone.utc)
     items: List[StudentAssignmentOverviewItem] = []
@@ -313,7 +277,6 @@ def list_student_assignments(
             else:
                 status_val = "not_submitted"
 
-        # Apply optional filter
         if filter_status and filter_status != "all":
             if filter_status == "pending" and status_val != "not_submitted":
                 continue
@@ -324,7 +287,8 @@ def list_student_assignments(
             elif filter_status == "past_due" and status_val != "past_due":
                 continue
 
-        course_title = a.course.title if a.course else "Course"
+        course = courses_map.get(a.course_id)
+        course_title = course.title if course else "Course"
 
         items.append(
             StudentAssignmentOverviewItem(
@@ -350,38 +314,46 @@ def list_student_assignments(
 
 
 def list_student_quiz_history(
-    db: Session, student_id: int
+    mongo_db: Database, student_id: int
 ) -> List[StudentQuizHistoryItem]:
     """
     Returns the student's past quiz attempt history across courses,
     displaying score, pass/fail state, and attempt limits, strictly excluding answer keys.
     """
-    attempts = (
-        db.query(QuizAttempt)
-        .options(joinedload(QuizAttempt.quiz).joinedload(Quiz.course))
-        .filter(
-            QuizAttempt.student_id == student_id,
-            QuizAttempt.is_completed == True,
-        )
-        .order_by(QuizAttempt.submitted_at.desc().nullslast(), QuizAttempt.started_at.desc())
-        .all()
+    attempts = list_quiz_attempts(
+        mongo_db, student_id=student_id, completed_only=True, sort_desc=True
     )
-
     if not attempts:
         return []
 
-    # Count total attempts per quiz for remaining attempts calculation
-    quiz_attempt_counts: dict[int, int] = {}
+    attempts.sort(
+        key=lambda a: (
+            _ensure_utc(a.submitted_at)
+            or _ensure_utc(a.started_at)
+            or datetime.min.replace(tzinfo=timezone.utc)
+        ),
+        reverse=True,
+    )
+
+    quiz_attempt_counts: Dict[int, int] = {}
+    quiz_cache: Dict[int, Optional[object]] = {}
     for a in attempts:
-        quiz_attempt_counts[a.quiz_id] = quiz_attempt_counts.get(a.quiz_id, 0) + 1
+        if a.quiz_id is not None:
+            quiz_attempt_counts[a.quiz_id] = quiz_attempt_counts.get(a.quiz_id, 0) + 1
+            if a.quiz_id not in quiz_cache:
+                quiz_cache[a.quiz_id] = get_quiz_by_id(mongo_db, a.quiz_id)
+
+    course_ids = [q.course_id for q in quiz_cache.values() if q is not None]
+    courses_map = get_courses_by_ids(mongo_db, course_ids)
 
     items: List[StudentQuizHistoryItem] = []
     for a in attempts:
-        quiz = a.quiz
+        quiz = quiz_cache.get(a.quiz_id) if a.quiz_id is not None else None
         if not quiz:
             continue
 
-        c_title = quiz.course.title if quiz.course else "Course"
+        course = courses_map.get(quiz.course_id)
+        c_title = course.title if course else "Course"
         rem_attempts = (
             max(0, quiz.max_attempts - quiz_attempt_counts.get(quiz.id, 0))
             if quiz.max_attempts > 0
@@ -411,48 +383,41 @@ def list_student_quiz_history(
 
 
 def get_recommended_courses(
-    db: Session, student_id: int, limit: int = 3
+    mongo_db: Database, student_id: int, limit: int = 3
 ) -> List[CourseResponse]:
     """
     Suggests published courses based on the student's enrolled categories.
     Excludes courses the student is already enrolled in.
     """
-    enrolled_courses = (
-        db.query(CourseEnrollment.course_id)
-        .filter(CourseEnrollment.student_id == student_id)
-        .all()
-    )
-    enrolled_ids = {e[0] for e in enrolled_courses}
+    enrollments = list_enrollments(mongo_db, student_id=student_id)
+    enrolled_ids = {e.course_id for e in enrollments}
 
-    # Extract categories from enrolled courses
     enrolled_categories: set[str] = set()
     if enrolled_ids:
-        cat_rows = (
-            db.query(Course.category)
-            .filter(Course.id.in_(list(enrolled_ids)))
-            .all()
-        )
-        enrolled_categories = {c[0] for c in cat_rows if c[0]}
+        enrolled_courses = get_courses_by_ids(mongo_db, enrolled_ids)
+        enrolled_categories = {c.category for c in enrolled_courses.values() if c.category}
 
-    # Find candidates
-    query = db.query(Course).filter(Course.is_published == True)
-    if enrolled_ids:
-        query = query.filter(Course.id.not_in(list(enrolled_ids)))
-
-    all_candidates = query.all()
+    all_candidates = list_all_courses(
+        mongo_db, is_published=True, exclude_ids=list(enrolled_ids) if enrolled_ids else None
+    )
     if not all_candidates:
         return []
 
-    # Sort matching categories first
     matching = [c for c in all_candidates if c.category in enrolled_categories]
     others = [c for c in all_candidates if c.category not in enrolled_categories]
-
     selected = (matching + others)[:limit]
-    return [enrich_course_response(db, c) for c in selected]
+
+    instructor_cache = get_users_by_ids(
+        mongo_db, [c.instructor_id for c in selected]
+    )
+    return [
+        enrich_course_response(mongo_db, c, instructor_cache=instructor_cache)
+        for c in selected
+    ]
 
 
 def get_student_dashboard_data(
-    db: Session, student_id: int
+    mongo_db: Database, student_id: int
 ) -> EnhancedStudentDashboardResponse:
     """
     Aggregates comprehensive real student telemetry:
@@ -463,7 +428,7 @@ def get_student_dashboard_data(
     - Enrolled courses with next lesson actions
     - Real course recommendations
     """
-    enrolled_courses = list_student_enrolled_courses(db, student_id)
+    enrolled_courses = list_student_enrolled_courses(mongo_db, student_id)
     approved_courses = [course for course in enrolled_courses if course.enrollment_status == "approved"]
     total_enrolled = len(enrolled_courses)
     completed_courses = sum(1 for e in approved_courses if e.completion_percentage >= 100.0)
@@ -475,11 +440,8 @@ def get_student_dashboard_data(
         else 0.0
     )
 
-    # Quiz statistics
-    quiz_attempts = (
-        db.query(QuizAttempt)
-        .filter(QuizAttempt.student_id == student_id, QuizAttempt.is_completed == True)
-        .all()
+    quiz_attempts = list_quiz_attempts(
+        mongo_db, student_id=student_id, completed_only=True, sort_desc=True
     )
     total_quizzes = len(quiz_attempts)
     passed_quizzes = sum(1 for a in quiz_attempts if a.passed)
@@ -489,8 +451,7 @@ def get_student_dashboard_data(
         else 0.0
     )
 
-    # Assignments overview
-    assignments = list_student_assignments(db, student_id)
+    assignments = list_student_assignments(mongo_db, student_id)
     total_assign = len(assignments)
     submitted_assign = sum(1 for a in assignments if a.submission_status in ("submitted", "graded"))
     pending_assign = sum(1 for a in assignments if a.submission_status == "not_submitted")
@@ -508,31 +469,37 @@ def get_student_dashboard_data(
         pending_assignments_count=pending_assign,
     )
 
-    # 1. Recently accessed lessons (real timestamps from LessonProgress)
-    recent_progress = (
-        db.query(LessonProgress)
-        .options(joinedload(LessonProgress.lesson).joinedload(Lesson.course))
-        .filter(LessonProgress.student_id == student_id)
-        .order_by(LessonProgress.updated_at.desc())
-        .limit(5)
-        .all()
+    all_progress = list_lesson_progress(mongo_db, student_id=student_id)
+    all_progress.sort(
+        key=lambda lp: _ensure_utc(lp.updated_at) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
     )
+    recent_progress = all_progress[:5]
+    lessons_map = get_lessons_by_ids(mongo_db, [rp.lesson_id for rp in recent_progress])
+    progress_courses_map = get_courses_by_ids(
+        mongo_db, [l.course_id for l in lessons_map.values()]
+    )
+
     recent_lessons: List[StudentRecentLessonActivity] = []
     for rp in recent_progress:
-        if rp.lesson and rp.lesson.course:
-            recent_lessons.append(
-                StudentRecentLessonActivity(
-                    lesson_id=rp.lesson_id,
-                    lesson_title=rp.lesson.title,
-                    course_id=rp.lesson.course_id,
-                    course_title=rp.lesson.course.title,
-                    is_completed=rp.is_completed,
-                    completed_at=rp.completed_at,
-                    updated_at=rp.updated_at,
-                )
+        lesson = lessons_map.get(rp.lesson_id)
+        if not lesson:
+            continue
+        course = progress_courses_map.get(lesson.course_id)
+        if not course:
+            continue
+        recent_lessons.append(
+            StudentRecentLessonActivity(
+                lesson_id=rp.lesson_id,
+                lesson_title=lesson.title,
+                course_id=lesson.course_id,
+                course_title=course.title,
+                is_completed=rp.is_completed,
+                completed_at=rp.completed_at,
+                updated_at=rp.updated_at,
             )
+        )
 
-    # 2. Upcoming assignment deadlines
     now_utc = datetime.now(timezone.utc)
     upcoming_deadlines: List[StudentUpcomingDeadline] = []
     for a in assignments:
@@ -554,16 +521,24 @@ def get_student_dashboard_data(
     upcoming_deadlines.sort(key=lambda x: _ensure_utc(x.due_date) or now_utc)
     upcoming_deadlines = upcoming_deadlines[:5]
 
-    # 3. Recent grades (quizzes + assignments)
     recent_grades: List[StudentRecentGrade] = []
-    # Quiz attempts
+    quiz_cache: Dict[int, Optional[object]] = {}
     for qa in quiz_attempts:
-        if qa.submitted_at and qa.quiz:
-            c_title = qa.quiz.course.title if qa.quiz.course else "Course"
+        if qa.quiz_id is not None and qa.quiz_id not in quiz_cache:
+            quiz_cache[qa.quiz_id] = get_quiz_by_id(mongo_db, qa.quiz_id)
+    grade_courses_map = get_courses_by_ids(
+        mongo_db, [q.course_id for q in quiz_cache.values() if q is not None]
+    )
+
+    for qa in quiz_attempts:
+        quiz = quiz_cache.get(qa.quiz_id) if qa.quiz_id is not None else None
+        if qa.submitted_at and quiz:
+            course = grade_courses_map.get(quiz.course_id)
+            c_title = course.title if course else "Course"
             recent_grades.append(
                 StudentRecentGrade(
                     assessment_type="quiz",
-                    title=qa.quiz.title,
+                    title=quiz.title,
                     course_title=c_title,
                     score_or_grade=qa.score,
                     max_score_or_grade=100.0,
@@ -575,7 +550,6 @@ def get_student_dashboard_data(
                 )
             )
 
-    # Graded assignments
     for a in assignments:
         if a.grade is not None and a.submitted_at:
             pct = round((a.grade / a.max_marks) * 100.0, 1) if a.max_marks > 0 else 0.0
@@ -597,8 +571,7 @@ def get_student_dashboard_data(
     recent_grades.sort(key=lambda g: _ensure_utc(g.date) or now_utc, reverse=True)
     recent_grades = recent_grades[:5]
 
-    # 4. Recommended courses
-    recommended = get_recommended_courses(db, student_id, limit=3)
+    recommended = get_recommended_courses(mongo_db, student_id, limit=3)
 
     return EnhancedStudentDashboardResponse(
         stats=stats,

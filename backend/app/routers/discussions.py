@@ -1,9 +1,10 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db
+from app.repositories.user_repository import MongoUser
 from app.schemas.common import MessageResponse
 from app.schemas.discussion import (
     DiscussionCreate,
@@ -39,11 +40,11 @@ def list_discussions(
     search: Optional[str] = Query(None, description="Search threads by title or content"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Page size"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     return service_list_course_discussions(
-        db=db,
+        mongo_db=mongo_db,
         course_id=course_id,
         user=current_user,
         search=search,
@@ -60,11 +61,18 @@ def list_discussions(
 def create_discussion_endpoint(
     course_id: int,
     discussion_in: DiscussionCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    thread = service_create_discussion(db, course_id, discussion_in, current_user)
-    return service_get_discussion_detail(db, thread.id, current_user)
+    thread = service_create_discussion(
+        mongo_db,
+        course_id,
+        discussion_in,
+        current_user,
+        sqlite_db=db,
+    )
+    return service_get_discussion_detail(mongo_db, thread.id, current_user)
 
 
 @router.get(
@@ -74,10 +82,10 @@ def create_discussion_endpoint(
 )
 def get_discussion_endpoint(
     discussion_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return service_get_discussion_detail(db, discussion_id, current_user)
+    return service_get_discussion_detail(mongo_db, discussion_id, current_user)
 
 
 @router.put(
@@ -88,11 +96,18 @@ def get_discussion_endpoint(
 def update_discussion_endpoint(
     discussion_id: int,
     discussion_in: DiscussionUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    service_update_discussion(db, discussion_id, discussion_in, current_user)
-    return service_get_discussion_detail(db, discussion_id, current_user)
+    service_update_discussion(
+        mongo_db,
+        discussion_id,
+        discussion_in,
+        current_user,
+        sqlite_db=db,
+    )
+    return service_get_discussion_detail(mongo_db, discussion_id, current_user)
 
 
 @router.delete(
@@ -102,10 +117,11 @@ def update_discussion_endpoint(
 )
 def delete_discussion_endpoint(
     discussion_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    service_delete_discussion(db, discussion_id, current_user)
+    service_delete_discussion(mongo_db, discussion_id, current_user, sqlite_db=db)
     return MessageResponse(message="Discussion thread deleted successfully.")
 
 
@@ -116,11 +132,12 @@ def delete_discussion_endpoint(
 )
 def toggle_pin_endpoint(
     discussion_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    service_toggle_pin_discussion(db, discussion_id, current_user)
-    return service_get_discussion_detail(db, discussion_id, current_user)
+    service_toggle_pin_discussion(mongo_db, discussion_id, current_user, sqlite_db=db)
+    return service_get_discussion_detail(mongo_db, discussion_id, current_user)
 
 
 @router.post(
@@ -132,11 +149,17 @@ def toggle_pin_endpoint(
 def create_reply_endpoint(
     discussion_id: int,
     reply_in: ReplyCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    reply = service_create_reply(db, discussion_id, reply_in, current_user)
-    return reply
+    return service_create_reply(
+        mongo_db,
+        discussion_id,
+        reply_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.put(
@@ -147,10 +170,17 @@ def create_reply_endpoint(
 def update_reply_endpoint(
     reply_id: int,
     reply_in: ReplyUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_update_reply(db, reply_id, reply_in, current_user)
+    return service_update_reply(
+        mongo_db,
+        reply_id,
+        reply_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.delete(
@@ -160,9 +190,9 @@ def update_reply_endpoint(
 )
 def delete_reply_endpoint(
     reply_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    service_delete_reply(db, reply_id, current_user)
+    service_delete_reply(mongo_db, reply_id, current_user, sqlite_db=db)
     return MessageResponse(message="Reply deleted successfully.")
-

@@ -16,7 +16,7 @@ def _instructor_payload(email="faculty.new@eduverse.io"):
     return {
         "full_name": "Faculty Member",
         "email": email,
-        "phone_number": "+1-555-0100",
+        "phone_number": "15550100",
         "qualification": "MSc Computer Science",
         "department": "Computer Science",
         "subject_expertise": "Distributed Systems",

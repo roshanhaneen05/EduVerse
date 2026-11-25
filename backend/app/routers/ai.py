@@ -1,21 +1,19 @@
-from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db
-from app.models.ai import AIConversation
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db
+from app.repositories.user_repository import MongoUser
 from app.schemas.ai import (
     AIChatRequest,
     AIChatResponse,
-    AIConversationDetail,
-    AIConversationSummary,
     LessonSummaryResponse,
     PracticeQuestionsResponse,
     StudyRecommendationsResponse,
 )
 from app.schemas.common import MessageResponse
 from app.services.ai_service import (
+    delete_user_conversation,
     generate_practice_questions_service,
     get_conversation_detail,
     get_student_study_recommendations,
@@ -34,10 +32,11 @@ router = APIRouter(prefix="/ai", tags=["AI Learning Assistant"])
 )
 def chat_with_assistant(
     request: AIChatRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return handle_ai_chat(db, current_user, request)
+    return handle_ai_chat(mongo_db, current_user, request, sqlite_db=db)
 
 
 @router.post(
@@ -47,10 +46,10 @@ def chat_with_assistant(
 )
 def summarize_lesson_endpoint(
     lesson_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return summarize_lesson_service(db, lesson_id, current_user)
+    return summarize_lesson_service(mongo_db, lesson_id, current_user)
 
 
 @router.post(
@@ -60,10 +59,10 @@ def summarize_lesson_endpoint(
 )
 def generate_practice_questions_endpoint(
     lesson_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return generate_practice_questions_service(db, lesson_id, current_user)
+    return generate_practice_questions_service(mongo_db, lesson_id, current_user)
 
 
 @router.get(
@@ -72,10 +71,10 @@ def generate_practice_questions_endpoint(
     summary="Get personalized study suggestions based on student's actual course progress and assessment history",
 )
 def get_study_recommendations_endpoint(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_student_study_recommendations(db, current_user.id)
+    return get_student_study_recommendations(mongo_db, current_user.id)
 
 
 @router.get(
@@ -83,10 +82,10 @@ def get_study_recommendations_endpoint(
     summary="List past AI conversations for current user",
 )
 def get_conversations(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return list_user_conversations(db, current_user.id)
+    return list_user_conversations(mongo_db, current_user.id)
 
 
 @router.get(
@@ -95,12 +94,14 @@ def get_conversations(
 )
 def get_conversation(
     conversation_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    detail = get_conversation_detail(db, conversation_id, current_user.id)
+    detail = get_conversation_detail(mongo_db, conversation_id, current_user.id)
     if not detail:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found."
+        )
     return detail
 
 
@@ -111,14 +112,9 @@ def get_conversation(
 )
 def delete_conversation(
     conversation_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    c = db.query(AIConversation).filter(AIConversation.id == conversation_id).first()
-    if not c:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-    if c.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete this conversation.")
-    db.delete(c)
-    db.commit()
+    delete_user_conversation(mongo_db, conversation_id, current_user.id, sqlite_db=db)
     return MessageResponse(message="Conversation deleted.")

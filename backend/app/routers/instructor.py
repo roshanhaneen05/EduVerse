@@ -1,23 +1,59 @@
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
-from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from pymongo.database import Database
+from sqlalchemy.orm import Session
 
-from app.dependencies import get_db, require_instructor
-from app.models.assignment import Assignment, AssignmentSubmission
+from app.dependencies import get_db, get_mongo_db, require_instructor
 from app.models.course import Course
 from app.models.section import CourseSection
-from app.models.enrollment import CourseEnrollment
-from app.models.email_delivery import EmailDelivery
 from app.models.lesson import Lesson
 from app.models.instructor import InstructorProfile
-from app.services.file_validator import validate_upload_content
-from app.services.storage import get_storage_provider
-from app.models.quiz import (
-    AnswerOption,
-    Question,
-    Quiz,
+from app.repositories.communication_repository import (
+    create_email_delivery_doc,
+    delete_email_delivery_doc,
+    delete_email_delivery_from_sqlite_shadow,
+    get_email_delivery_by_id,
+    sync_email_delivery_to_sqlite_shadow,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    claim_pending_enrollment_review,
+    count_lessons_for_section,
+    create_lesson_doc,
+    create_section_doc,
+    delete_course_cascade_mongo,
+    delete_course_from_sqlite_shadow,
+    delete_lesson_doc,
+    delete_lesson_from_sqlite_shadow,
+    delete_section_doc,
+    delete_section_from_sqlite_shadow,
+    get_course_by_id,
+    get_enrollment_by_id,
+    get_lesson_by_id,
+    get_section_by_id,
+    list_courses_filtered,
+    list_enrollments_for_courses,
+    list_lessons_for_course,
+    list_sections_for_course,
+    reassign_lessons_section,
+    reorder_sections_in_course,
+    restore_course_snapshot,
+    restore_enrollment_snapshot,
+    restore_lesson_snapshot,
+    restore_section_snapshot,
+    sync_course_to_sqlite_shadow,
+    sync_enrollment_to_sqlite_shadow,
+    sync_lesson_to_sqlite_shadow,
+    sync_section_to_sqlite_shadow,
+    update_course_doc,
+    update_lesson_doc,
+    update_section_doc,
+)
+from app.repositories.user_repository import (
+    MongoUser,
+    get_instructor_profile_by_user_id,
+    get_users_by_ids,
 )
 from app.models.user import User
 from app.schemas.admin import InstructorDashboardStats
@@ -78,7 +114,9 @@ from app.schemas.section import (
 from app.services.assignment_service import (
     create_assignment as service_create_assignment,
     delete_assignment as service_delete_assignment,
+    get_assignment_for_instructor,
     get_assignment_submissions_for_instructor,
+    get_submission_detail_for_instructor,
     grade_submission as service_grade_submission,
     list_instructor_assignments,
     toggle_assignment_status,
@@ -101,7 +139,7 @@ router = APIRouter(prefix="/instructor", tags=["Instructor Management"])
 settings = get_settings()
 
 
-def check_course_ownership(course: Course, user: User):
+def check_course_ownership(course: MongoCourse | Course, user: MongoUser | User):
     """Ensure that the instructor owns this course (or is an administrator)."""
     if user.role != "admin" and course.instructor_id != user.id:
         raise HTTPException(
@@ -116,14 +154,10 @@ def check_course_ownership(course: Course, user: User):
     summary="Get the authenticated instructor's profile",
 )
 def get_instructor_profile(
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    profile = (
-        db.query(InstructorProfile)
-        .filter(InstructorProfile.user_id == current_user.id)
-        .first()
-    )
+    profile = get_instructor_profile_by_user_id(mongo_db, current_user.id)
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instructor profile not found.")
     return InstructorResponse(
@@ -148,10 +182,10 @@ def get_instructor_profile(
     summary="Get instructor dashboard statistics and recent enrollments",
 )
 def get_instructor_stats(
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_instructor_dashboard_analytics(db, current_user)
+    return get_instructor_dashboard_analytics(mongo_db, current_user)
 
 
 @router.get(
@@ -160,36 +194,43 @@ def get_instructor_stats(
     summary="List enrollments for courses managed by the authenticated instructor",
 )
 def get_instructor_enrollments(
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    query = (
-        db.query(CourseEnrollment)
-        .join(Course, Course.id == CourseEnrollment.course_id)
-        .options(
-            joinedload(CourseEnrollment.student),
-            joinedload(CourseEnrollment.course),
-        )
-    )
-    if current_user.role != "admin":
-        query = query.filter(Course.instructor_id == current_user.id)
+    instructor_filter = None if current_user.role == "admin" else current_user.id
+    courses = list_courses_filtered(mongo_db, instructor_id=instructor_filter, limit=5000)
+    course_map = {c.id: c for c in courses}
+    if not course_map:
+        return []
 
-    enrollments = query.order_by(CourseEnrollment.enrolled_at.desc()).all()
-    return [
-        InstructorEnrollmentResponse(
-            enrollment_id=enrollment.id,
-            student_id=enrollment.student_id,
-            student_name=enrollment.student.full_name,
-            student_email=enrollment.student.email,
-            course_id=enrollment.course_id,
-            course_name=enrollment.course.title,
-            instructor_id=enrollment.course.instructor_id,
-            enrolled_at=enrollment.enrolled_at,
-            status=enrollment.status,
-            reviewed_at=enrollment.reviewed_at,
+    enrollments = list_enrollments_for_courses(
+        mongo_db,
+        course_ids=list(course_map.keys()),
+        sort_asc=False,
+    )
+    student_map = get_users_by_ids(mongo_db, [e.student_id for e in enrollments])
+
+    results = []
+    for enrollment in enrollments:
+        course = course_map.get(enrollment.course_id)
+        student = student_map.get(enrollment.student_id)
+        if not course or not student:
+            continue
+        results.append(
+            InstructorEnrollmentResponse(
+                enrollment_id=enrollment.id,
+                student_id=enrollment.student_id,
+                student_name=student.full_name,
+                student_email=student.email,
+                course_id=enrollment.course_id,
+                course_name=course.title,
+                instructor_id=course.instructor_id,
+                enrolled_at=enrollment.enrolled_at,
+                status=enrollment.status,
+                reviewed_at=enrollment.reviewed_at,
+            )
         )
-        for enrollment in enrollments
-    ]
+    return results
 
 
 @router.get(
@@ -198,8 +239,8 @@ def get_instructor_enrollments(
     summary="List pending enrollment requests for the authenticated instructor",
 )
 def get_enrollment_requests(
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     if current_user.role != "instructor":
         raise HTTPException(
@@ -207,42 +248,48 @@ def get_enrollment_requests(
             detail="Only the assigned instructor can review enrollment requests.",
         )
 
-    requests = (
-        db.query(CourseEnrollment)
-        .join(Course, Course.id == CourseEnrollment.course_id)
-        .options(
-            joinedload(CourseEnrollment.student),
-            joinedload(CourseEnrollment.course),
-        )
-        .filter(
-            Course.instructor_id == current_user.id,
-            CourseEnrollment.status == "pending",
-        )
-        .order_by(CourseEnrollment.enrolled_at.asc())
-        .all()
+    courses = list_courses_filtered(mongo_db, instructor_id=current_user.id, limit=5000)
+    course_map = {c.id: c for c in courses}
+    if not course_map:
+        return []
+
+    requests = list_enrollments_for_courses(
+        mongo_db,
+        course_ids=list(course_map.keys()),
+        status_filter="pending",
+        sort_asc=True,
     )
-    return [
-        InstructorEnrollmentResponse(
-            enrollment_id=enrollment.id,
-            student_id=enrollment.student_id,
-            student_name=enrollment.student.full_name,
-            student_email=enrollment.student.email,
-            course_id=enrollment.course_id,
-            course_name=enrollment.course.title,
-            instructor_id=current_user.id,
-            enrolled_at=enrollment.enrolled_at,
-            status=enrollment.status,
-            reviewed_at=enrollment.reviewed_at,
+    student_map = get_users_by_ids(mongo_db, [e.student_id for e in requests])
+
+    results = []
+    for enrollment in requests:
+        course = course_map.get(enrollment.course_id)
+        student = student_map.get(enrollment.student_id)
+        if not course or not student:
+            continue
+        results.append(
+            InstructorEnrollmentResponse(
+                enrollment_id=enrollment.id,
+                student_id=enrollment.student_id,
+                student_name=student.full_name,
+                student_email=student.email,
+                course_id=enrollment.course_id,
+                course_name=course.title,
+                instructor_id=current_user.id,
+                enrolled_at=enrollment.enrolled_at,
+                status=enrollment.status,
+                reviewed_at=enrollment.reviewed_at,
+            )
         )
-        for enrollment in requests
-    ]
+    return results
 
 
 def _review_enrollment(
     enrollment_id: int,
     decision: str,
     event_type: str,
-    current_user: User,
+    current_user: MongoUser,
+    mongo_db: Database,
     db: Session,
 ) -> EnrollmentDecisionResponse:
     if current_user.role != "instructor":
@@ -251,19 +298,11 @@ def _review_enrollment(
             detail="Only the assigned instructor can review enrollment requests.",
         )
 
-    enrollment = (
-        db.query(CourseEnrollment)
-        .options(
-            joinedload(CourseEnrollment.course),
-            joinedload(CourseEnrollment.student),
-        )
-        .filter(CourseEnrollment.id == enrollment_id)
-        .with_for_update()
-        .first()
-    )
-    if not enrollment or not enrollment.course:
+    enrollment = get_enrollment_by_id(mongo_db, enrollment_id)
+    course = get_course_by_id(mongo_db, enrollment.course_id) if enrollment else None
+    if not enrollment or not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enrollment request not found.")
-    if enrollment.course.instructor_id != current_user.id:
+    if course.instructor_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You may only review requests for your assigned courses.",
@@ -274,22 +313,49 @@ def _review_enrollment(
             detail="This enrollment request has already been reviewed.",
         )
 
-    enrollment.status = decision
-    enrollment.reviewed_at = datetime.now(timezone.utc)
-    enrollment.reviewed_by_instructor_id = current_user.id
-    delivery = EmailDelivery(
-        enrollment_id=enrollment.id,
-        event_type=event_type,
-        recipient_email=enrollment.student.email,
-    )
-    db.add(delivery)
-    db.commit()
-    db.refresh(delivery)
+    student = get_users_by_ids(mongo_db, [enrollment.student_id]).get(enrollment.student_id)
+    if not student:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student account not found.")
 
-    email_status = send_email_delivery(db, delivery, settings)
+    reviewed_at = datetime.now(timezone.utc)
+    updated_enr = claim_pending_enrollment_review(
+        mongo_db,
+        enrollment.id,
+        decision=decision,
+        reviewer_id=current_user.id,
+        reviewed_at=reviewed_at,
+    )
+    if not updated_enr:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This enrollment request has already been reviewed.",
+        )
+
+    delivery = None
+    try:
+        delivery = create_email_delivery_doc(
+            mongo_db,
+            enrollment_id=updated_enr.id,
+            event_type=event_type,
+            recipient_email=student.email,
+        )
+        sync_enrollment_to_sqlite_shadow(db, updated_enr)
+        sync_email_delivery_to_sqlite_shadow(db, delivery)
+    except Exception:
+        db.rollback()
+        if delivery is not None:
+            delete_email_delivery_from_sqlite_shadow(db, delivery.id)
+            delete_email_delivery_doc(mongo_db, delivery.id)
+        restore_enrollment_snapshot(mongo_db, enrollment)
+        raise
+
+    email_status = send_email_delivery(mongo_db, delivery, settings)
+    latest_delivery = get_email_delivery_by_id(mongo_db, delivery.id)
+    if latest_delivery is not None:
+        sync_email_delivery_to_sqlite_shadow(db, latest_delivery)
     return EnrollmentDecisionResponse(
-        enrollment_id=enrollment.id,
-        status=enrollment.status,
+        enrollment_id=updated_enr.id,
+        status=updated_enr.status,
         email_notification_status=email_status,
         email_delivery_id=delivery.id,
     )
@@ -302,7 +368,8 @@ def _review_enrollment(
 )
 def approve_enrollment(
     enrollment_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     return _review_enrollment(
@@ -310,6 +377,7 @@ def approve_enrollment(
         "approved",
         ENROLLMENT_APPROVED,
         current_user,
+        mongo_db,
         db,
     )
 
@@ -321,7 +389,8 @@ def approve_enrollment(
 )
 def reject_enrollment(
     enrollment_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     return _review_enrollment(
@@ -329,6 +398,7 @@ def reject_enrollment(
         "rejected",
         ENROLLMENT_REJECTED,
         current_user,
+        mongo_db,
         db,
     )
 
@@ -340,10 +410,10 @@ def reject_enrollment(
 )
 def get_course_analytics_endpoint(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_course_analytics(db, course_id, current_user)
+    return get_course_analytics(mongo_db, course_id, current_user)
 
 
 @router.get(
@@ -353,10 +423,10 @@ def get_course_analytics_endpoint(
 )
 def get_course_student_report_endpoint(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_course_student_report(db, course_id, current_user)
+    return get_course_student_report(mongo_db, course_id, current_user)
 
 
 @router.get(
@@ -365,10 +435,10 @@ def get_course_student_report_endpoint(
 )
 def export_course_student_report_csv_endpoint(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    csv_content = generate_student_report_csv(db, course_id, current_user)
+    csv_content = generate_student_report_csv(mongo_db, course_id, current_user)
     return Response(
         content=csv_content,
         media_type="text/csv",
@@ -386,10 +456,10 @@ def export_course_student_report_csv_endpoint(
 def get_student_detailed_progress_endpoint(
     course_id: int,
     student_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_student_detailed_progress(db, course_id, student_id, current_user)
+    return get_student_detailed_progress(mongo_db, course_id, student_id, current_user)
 
 
 @router.get(
@@ -398,11 +468,11 @@ def get_student_detailed_progress_endpoint(
     summary="List courses created by the current instructor",
 )
 def get_my_courses(
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     instructor_id = None if current_user.role == "admin" else current_user.id
-    return list_courses(db=db, instructor_id=instructor_id)
+    return list_courses(mongo_db=mongo_db, instructor_id=instructor_id)
 
 
 @router.post(
@@ -413,11 +483,12 @@ def get_my_courses(
 )
 def create_new_course(
     course_in: CourseCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = create_course(db, course_in, instructor_id=current_user.id)
-    return enrich_course_response(db, course)
+    course = create_course(mongo_db, course_in, instructor_id=current_user.id, sqlite_db=db)
+    return enrich_course_response(mongo_db, course)
 
 
 @router.put(
@@ -428,16 +499,17 @@ def create_new_course(
 def update_existing_course(
     course_id: int,
     course_in: CourseUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    updated = update_course(db, course, course_in)
-    return enrich_course_response(db, updated)
+    updated = update_course(mongo_db, course, course_in, sqlite_db=db)
+    return enrich_course_response(mongo_db, updated)
 
 
 @router.delete(
@@ -447,16 +519,17 @@ def update_existing_course(
 )
 def delete_existing_course(
     course_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    db.delete(course)
-    db.commit()
+    delete_course_cascade_mongo(mongo_db, course_id)
+    delete_course_from_sqlite_shadow(db, course_id)
     return MessageResponse(message="Course successfully deleted.")
 
 
@@ -467,18 +540,24 @@ def delete_existing_course(
 )
 def toggle_publish_course(
     course_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    course.is_published = not course.is_published
-    db.commit()
-    db.refresh(course)
-    return enrich_course_response(db, course)
+    updated = update_course_doc(mongo_db, course.id, {"is_published": not course.is_published})
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    try:
+        sync_course_to_sqlite_shadow(db, updated)
+    except Exception:
+        restore_course_snapshot(mongo_db, course)
+        raise
+    return enrich_course_response(mongo_db, updated)
 
 
 @router.get(
@@ -487,36 +566,38 @@ def toggle_publish_course(
 )
 def get_course_students(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    enrollments = (
-        db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.student))
-        .filter(
-            CourseEnrollment.course_id == course_id,
-            CourseEnrollment.status == "approved",
-        )
-        .all()
+    enrollments = list_enrollments_for_courses(
+        mongo_db,
+        course_ids=[course_id],
+        status_filter="approved",
+        sort_asc=True,
     )
+    student_map = get_users_by_ids(mongo_db, [e.student_id for e in enrollments])
 
-    return [
-        {
-            "enrollment_id": e.id,
-            "student_id": e.student.id,
-            "full_name": e.student.full_name,
-            "email": e.student.email,
-            "enrolled_at": e.enrolled_at.isoformat(),
-            "completion_percentage": e.completion_percentage,
-        }
-        for e in enrollments
-        if e.student
-    ]
+    results = []
+    for e in enrollments:
+        student = student_map.get(e.student_id)
+        if not student:
+            continue
+        results.append(
+            {
+                "enrollment_id": e.id,
+                "student_id": student.id,
+                "full_name": student.full_name,
+                "email": student.email,
+                "enrolled_at": e.enrolled_at.isoformat(),
+                "completion_percentage": e.completion_percentage,
+            }
+        )
+    return results
 
 
 @router.post(
@@ -528,15 +609,25 @@ def get_course_students(
 def add_lesson(
     course_id: int,
     lesson_in: LessonCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    lesson = Lesson(
+    if lesson_in.section_id is not None:
+        target_sec = get_section_by_id(mongo_db, lesson_in.section_id)
+        if not target_sec or target_sec.course_id != course_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Section does not exist or does not belong to this course.",
+            )
+
+    lesson = create_lesson_doc(
+        mongo_db,
         course_id=course_id,
         section_id=lesson_in.section_id,
         title=lesson_in.title.strip(),
@@ -544,9 +635,11 @@ def add_lesson(
         video_url=lesson_in.video_url.strip() if lesson_in.video_url else None,
         order_index=lesson_in.order_index,
     )
-    db.add(lesson)
-    db.commit()
-    db.refresh(lesson)
+    try:
+        sync_lesson_to_sqlite_shadow(db, lesson)
+    except Exception:
+        delete_lesson_doc(mongo_db, lesson.id)
+        raise
 
     return LessonResponse(
         id=lesson.id,
@@ -560,7 +653,6 @@ def add_lesson(
         created_at=lesson.created_at,
         updated_at=lesson.updated_at,
     )
-
 
 
 @router.put(
@@ -571,38 +663,57 @@ def add_lesson(
 def update_existing_lesson(
     lesson_id: int,
     lesson_in: LessonUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+    lesson = get_lesson_by_id(mongo_db, lesson_id)
     if not lesson:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found.")
-    course = db.query(Course).filter(Course.id == lesson.course_id).first()
+    course = get_course_by_id(mongo_db, lesson.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
+    updates: dict = {}
     if lesson_in.title is not None:
-        lesson.title = lesson_in.title.strip()
+        updates["title"] = lesson_in.title.strip()
     if lesson_in.content is not None:
-        lesson.content = lesson_in.content.strip()
+        updates["content"] = lesson_in.content.strip()
     if lesson_in.order_index is not None:
-        lesson.order_index = lesson_in.order_index
+        updates["order_index"] = lesson_in.order_index
+    if "video_url" in lesson_in.model_fields_set:
+        updates["video_url"] = lesson_in.video_url.strip() if lesson_in.video_url else None
     if "section_id" in lesson_in.model_fields_set:
-        lesson.section_id = lesson_in.section_id
+        if lesson_in.section_id is not None:
+            target_sec = get_section_by_id(mongo_db, lesson_in.section_id)
+            if not target_sec or target_sec.course_id != lesson.course_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Section does not exist or does not belong to this course.",
+                )
+        updates["section_id"] = lesson_in.section_id
 
-    db.commit()
-    db.refresh(lesson)
+    updated = update_lesson_doc(mongo_db, lesson.id, updates) if updates else lesson
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found.")
+    try:
+        sync_lesson_to_sqlite_shadow(db, updated)
+    except Exception:
+        restore_lesson_snapshot(mongo_db, lesson)
+        raise
 
     return LessonResponse(
-        id=lesson.id,
-        course_id=lesson.course_id,
-        section_id=lesson.section_id,
-        title=lesson.title,
-        content=lesson.content,
-        video_url=lesson.video_url,
-        order_index=lesson.order_index,
+        id=updated.id,
+        course_id=updated.course_id,
+        section_id=updated.section_id,
+        title=updated.title,
+        content=updated.content,
+        video_url=updated.video_url,
+        order_index=updated.order_index,
         is_completed=False,
-        created_at=lesson.created_at,
-        updated_at=lesson.updated_at,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
     )
 
 
@@ -613,17 +724,20 @@ def update_existing_lesson(
 )
 def delete_existing_lesson(
     lesson_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+    lesson = get_lesson_by_id(mongo_db, lesson_id)
     if not lesson:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found.")
-    course = db.query(Course).filter(Course.id == lesson.course_id).first()
+    course = get_course_by_id(mongo_db, lesson.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    db.delete(lesson)
-    db.commit()
+    delete_lesson_doc(mongo_db, lesson_id)
+    delete_lesson_from_sqlite_shadow(db, lesson_id)
     return MessageResponse(message="Lesson successfully deleted.")
 
 
@@ -638,10 +752,10 @@ def delete_existing_lesson(
 )
 def get_course_quizzes_instructor(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return list_quizzes_for_course_instructor(db, course_id, current_user)
+    return list_quizzes_for_course_instructor(mongo_db, course_id, current_user)
 
 
 @router.get(
@@ -651,10 +765,10 @@ def get_course_quizzes_instructor(
 )
 def get_quiz_detail_instructor(
     quiz_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_quiz_detail_for_instructor(db, quiz_id, current_user)
+    return get_quiz_detail_for_instructor(mongo_db, quiz_id, current_user)
 
 
 @router.post(
@@ -666,10 +780,11 @@ def get_quiz_detail_instructor(
 def create_quiz(
     course_id: int,
     quiz_in: QuizCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return create_instructor_quiz(db, course_id, quiz_in, current_user)
+    return create_instructor_quiz(mongo_db, course_id, quiz_in, current_user, sqlite_db=db)
 
 
 @router.put(
@@ -680,10 +795,11 @@ def create_quiz(
 def update_quiz(
     quiz_id: int,
     quiz_in: QuizUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return update_instructor_quiz(db, quiz_id, quiz_in, current_user)
+    return update_instructor_quiz(mongo_db, quiz_id, quiz_in, current_user, sqlite_db=db)
 
 
 @router.patch(
@@ -693,10 +809,11 @@ def update_quiz(
 )
 def toggle_quiz_publication(
     quiz_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return toggle_publish_quiz(db, quiz_id, current_user)
+    return toggle_publish_quiz(mongo_db, quiz_id, current_user, sqlite_db=db)
 
 
 @router.delete(
@@ -706,10 +823,11 @@ def toggle_quiz_publication(
 )
 def delete_quiz(
     quiz_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    delete_instructor_quiz(db, quiz_id, current_user)
+    delete_instructor_quiz(mongo_db, quiz_id, current_user, sqlite_db=db)
     return MessageResponse(message="Quiz successfully deleted.")
 
 
@@ -722,10 +840,11 @@ def delete_quiz(
 def add_question_to_quiz(
     quiz_id: int,
     question_in: QuestionCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return add_quiz_question(db, quiz_id, question_in, current_user)
+    return add_quiz_question(mongo_db, quiz_id, question_in, current_user, sqlite_db=db)
 
 
 @router.put(
@@ -736,10 +855,11 @@ def add_question_to_quiz(
 def update_question_in_quiz(
     question_id: int,
     question_in: QuestionCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return update_quiz_question(db, question_id, question_in, current_user)
+    return update_quiz_question(mongo_db, question_id, question_in, current_user, sqlite_db=db)
 
 
 @router.delete(
@@ -749,10 +869,11 @@ def update_question_in_quiz(
 )
 def remove_question_from_quiz(
     question_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    delete_quiz_question(db, question_id, current_user)
+    delete_quiz_question(mongo_db, question_id, current_user, sqlite_db=db)
     return MessageResponse(message="Question successfully deleted.")
 
 
@@ -768,26 +889,16 @@ def remove_question_from_quiz(
 )
 def get_course_sections(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    sections = (
-        db.query(CourseSection)
-        .filter(CourseSection.course_id == course_id)
-        .order_by(CourseSection.order_index.asc())
-        .all()
-    )
-    lessons = (
-        db.query(Lesson)
-        .filter(Lesson.course_id == course_id)
-        .order_by(Lesson.order_index.asc())
-        .all()
-    )
+    sections = list_sections_for_course(mongo_db, course_id)
+    lessons = list_lessons_for_course(mongo_db, course_id)
     lesson_map = {}
     for l in lessons:
         lesson_map.setdefault(l.section_id, []).append(
@@ -829,23 +940,28 @@ def get_course_sections(
 def create_course_section(
     course_id: int,
     section_in: SectionCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    section = CourseSection(
+    section = create_section_doc(
+        mongo_db,
         course_id=course_id,
         title=section_in.title.strip(),
         description=section_in.description.strip() if section_in.description else None,
         order_index=section_in.order_index,
     )
-    db.add(section)
-    db.commit()
-    db.refresh(section)
+    try:
+        sync_section_to_sqlite_shadow(db, section)
+    except Exception:
+        delete_section_doc(mongo_db, section.id)
+        raise
+
     return SectionResponse(
         id=section.id,
         course_id=section.course_id,
@@ -866,35 +982,45 @@ def create_course_section(
 def update_course_section(
     section_id: int,
     section_in: SectionUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    section = db.query(CourseSection).filter(CourseSection.id == section_id).first()
+    section = get_section_by_id(mongo_db, section_id)
     if not section:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Section not found.")
-    course = db.query(Course).filter(Course.id == section.course_id).first()
+    course = get_course_by_id(mongo_db, section.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
+    updates: dict = {}
     if section_in.title is not None:
-        section.title = section_in.title.strip()
+        updates["title"] = section_in.title.strip()
     if section_in.description is not None:
-        section.description = section_in.description.strip() if section_in.description else None
+        updates["description"] = section_in.description.strip() if section_in.description else None
     if section_in.order_index is not None:
-        section.order_index = section_in.order_index
+        updates["order_index"] = section_in.order_index
 
-    db.commit()
-    db.refresh(section)
+    updated = update_section_doc(mongo_db, section.id, updates) if updates else section
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Section not found.")
+    try:
+        sync_section_to_sqlite_shadow(db, updated)
+    except Exception:
+        restore_section_snapshot(mongo_db, section)
+        raise
 
-    lesson_count = db.query(Lesson).filter(Lesson.section_id == section.id).count()
+    lesson_count = count_lessons_for_section(mongo_db, updated.id)
     return SectionResponse(
-        id=section.id,
-        course_id=section.course_id,
-        title=section.title,
-        description=section.description,
-        order_index=section.order_index,
+        id=updated.id,
+        course_id=updated.course_id,
+        title=updated.title,
+        description=updated.description,
+        order_index=updated.order_index,
         lesson_count=lesson_count,
-        created_at=section.created_at,
-        updated_at=section.updated_at,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
     )
 
 
@@ -906,16 +1032,19 @@ def update_course_section(
 def delete_course_section(
     section_id: int,
     reassign_to_section_id: Optional[int] = None,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    section = db.query(CourseSection).filter(CourseSection.id == section_id).first()
+    section = get_section_by_id(mongo_db, section_id)
     if not section:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Section not found.")
-    course = db.query(Course).filter(Course.id == section.course_id).first()
+    course = get_course_by_id(mongo_db, section.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    lesson_count = db.query(Lesson).filter(Lesson.section_id == section_id).count()
+    lesson_count = count_lessons_for_section(mongo_db, section_id)
     if lesson_count > 0:
         if reassign_to_section_id is not None:
             if reassign_to_section_id == section_id:
@@ -923,33 +1052,26 @@ def delete_course_section(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Cannot reassign lessons to the section being deleted.",
                 )
-            target_sec = (
-                db.query(CourseSection)
-                .filter(
-                    CourseSection.id == reassign_to_section_id,
-                    CourseSection.course_id == section.course_id,
-                )
-                .first()
-            )
-            if not target_sec:
+            target_sec = get_section_by_id(mongo_db, reassign_to_section_id)
+            if not target_sec or target_sec.course_id != section.course_id:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Target reassign section does not exist in this course.",
                 )
+            reassign_lessons_section(mongo_db, section_id, reassign_to_section_id)
             db.query(Lesson).filter(Lesson.section_id == section_id).update(
                 {"section_id": reassign_to_section_id},
                 synchronize_session="fetch",
             )
-            db.flush()
-            db.expire_all()
+            db.commit()
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot delete section that contains lessons. Reassign or delete the lessons first, or specify reassign_to_section_id.",
             )
 
-    db.delete(section)
-    db.commit()
+    delete_section_doc(mongo_db, section_id)
+    delete_section_from_sqlite_shadow(db, section_id)
     return MessageResponse(message="Section successfully deleted.")
 
 
@@ -961,20 +1083,21 @@ def delete_course_section(
 def reorder_course_sections(
     course_id: int,
     orders: List[SectionOrderUpdate],
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
     order_map = {item.section_id: item.order_index for item in orders}
+    reorder_sections_in_course(mongo_db, course_id, order_map)
     sections = db.query(CourseSection).filter(CourseSection.course_id == course_id).all()
     for s in sections:
         if s.id in order_map:
             s.order_index = order_map[s.id]
-
     db.commit()
     return MessageResponse(message="Section ordering updated successfully.")
 
@@ -987,50 +1110,53 @@ def reorder_course_sections(
 def assign_lesson_to_section(
     lesson_id: int,
     assignment: LessonAssignSection,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+    lesson = get_lesson_by_id(mongo_db, lesson_id)
     if not lesson:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found.")
-    course = db.query(Course).filter(Course.id == lesson.course_id).first()
+    course = get_course_by_id(mongo_db, lesson.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
+    updates: dict = {}
     if assignment.section_id is not None:
-        target_sec = (
-            db.query(CourseSection)
-            .filter(
-                CourseSection.id == assignment.section_id,
-                CourseSection.course_id == lesson.course_id,
-            )
-            .first()
-        )
-        if not target_sec:
+        target_sec = get_section_by_id(mongo_db, assignment.section_id)
+        if not target_sec or target_sec.course_id != lesson.course_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Section does not exist or does not belong to this course.",
             )
-        lesson.section_id = assignment.section_id
+        updates["section_id"] = assignment.section_id
     else:
-        lesson.section_id = None
+        updates["section_id"] = None
 
     if assignment.order_index is not None:
-        lesson.order_index = assignment.order_index
+        updates["order_index"] = assignment.order_index
 
-    db.commit()
-    db.refresh(lesson)
+    updated = update_lesson_doc(mongo_db, lesson.id, updates)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found.")
+    try:
+        sync_lesson_to_sqlite_shadow(db, updated)
+    except Exception:
+        restore_lesson_snapshot(mongo_db, lesson)
+        raise
 
     return LessonResponse(
-        id=lesson.id,
-        course_id=lesson.course_id,
-        section_id=lesson.section_id,
-        title=lesson.title,
-        content=lesson.content,
-        video_url=lesson.video_url,
-        order_index=lesson.order_index,
+        id=updated.id,
+        course_id=updated.course_id,
+        section_id=updated.section_id,
+        title=updated.title,
+        content=updated.content,
+        video_url=updated.video_url,
+        order_index=updated.order_index,
         is_completed=False,
-        created_at=lesson.created_at,
-        updated_at=lesson.updated_at,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
     )
 
 
@@ -1048,10 +1174,17 @@ def assign_lesson_to_section(
 def create_course_assignment(
     course_id: int,
     assignment_in: AssignmentCreate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_create_assignment(db, course_id, assignment_in, current_user)
+    return service_create_assignment(
+        mongo_db,
+        course_id,
+        assignment_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.get(
@@ -1061,10 +1194,10 @@ def create_course_assignment(
 )
 def get_instructor_assignments(
     course_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return list_instructor_assignments(db, course_id, current_user)
+    return list_instructor_assignments(mongo_db, course_id, current_user)
 
 
 @router.get(
@@ -1074,40 +1207,10 @@ def get_instructor_assignments(
 )
 def get_instructor_assignment_detail(
     assignment_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    assignment = db.query(Assignment).filter(Assignment.id == assignment_id).first()
-    if not assignment:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assignment not found.")
-    course = db.query(Course).filter(Course.id == assignment.course_id).first()
-    check_course_ownership(course, current_user)
-
-    sub_count = db.query(AssignmentSubmission).filter(AssignmentSubmission.assignment_id == assignment.id).count()
-    graded_count = (
-        db.query(AssignmentSubmission)
-        .filter(AssignmentSubmission.assignment_id == assignment.id, AssignmentSubmission.grade.isnot(None))
-        .count()
-    )
-
-    return AssignmentResponse(
-        id=assignment.id,
-        course_id=assignment.course_id,
-        section_id=assignment.section_id,
-        title=assignment.title,
-        description=assignment.description,
-        instructions=assignment.instructions,
-        max_marks=assignment.max_marks,
-        due_date=assignment.due_date,
-        is_published=assignment.is_published,
-        is_closed=assignment.is_closed,
-        allow_resubmission=assignment.allow_resubmission,
-        is_archived=assignment.is_archived,
-        created_at=assignment.created_at,
-        updated_at=assignment.updated_at,
-        submission_count=sub_count,
-        graded_count=graded_count,
-    )
+    return get_assignment_for_instructor(mongo_db, assignment_id, current_user)
 
 
 @router.put(
@@ -1118,10 +1221,17 @@ def get_instructor_assignment_detail(
 def update_course_assignment(
     assignment_id: int,
     assignment_in: AssignmentUpdate,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_update_assignment(db, assignment_id, assignment_in, current_user)
+    return service_update_assignment(
+        mongo_db,
+        assignment_id,
+        assignment_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.patch(
@@ -1131,10 +1241,17 @@ def update_course_assignment(
 )
 def toggle_publish_assignment(
     assignment_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return toggle_assignment_status(db, assignment_id, "is_published", current_user)
+    return toggle_assignment_status(
+        mongo_db,
+        assignment_id,
+        "is_published",
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.patch(
@@ -1144,10 +1261,17 @@ def toggle_publish_assignment(
 )
 def toggle_close_assignment(
     assignment_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return toggle_assignment_status(db, assignment_id, "is_closed", current_user)
+    return toggle_assignment_status(
+        mongo_db,
+        assignment_id,
+        "is_closed",
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.patch(
@@ -1157,10 +1281,17 @@ def toggle_close_assignment(
 )
 def toggle_archive_assignment(
     assignment_id: int,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return toggle_assignment_status(db, assignment_id, "is_archived", current_user)
+    return toggle_assignment_status(
+        mongo_db,
+        assignment_id,
+        "is_archived",
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.delete(
@@ -1170,10 +1301,17 @@ def toggle_archive_assignment(
 def delete_course_assignment(
     assignment_id: int,
     archive_if_submissions: bool = False,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_delete_assignment(db, assignment_id, current_user, archive_if_submissions=archive_if_submissions)
+    return service_delete_assignment(
+        mongo_db,
+        assignment_id,
+        current_user,
+        archive_if_submissions=archive_if_submissions,
+        sqlite_db=db,
+    )
 
 
 @router.get(
@@ -1183,10 +1321,10 @@ def delete_course_assignment(
 )
 def get_assignment_submissions(
     assignment_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_assignment_submissions_for_instructor(db, assignment_id, current_user)
+    return get_assignment_submissions_for_instructor(mongo_db, assignment_id, current_user)
 
 
 @router.get(
@@ -1196,44 +1334,10 @@ def get_assignment_submissions(
 )
 def get_submission_detail(
     submission_id: int,
-    current_user: User = Depends(require_instructor),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    submission = (
-        db.query(AssignmentSubmission)
-        .options(joinedload(AssignmentSubmission.assignment), joinedload(AssignmentSubmission.student))
-        .filter(AssignmentSubmission.id == submission_id)
-        .first()
-    )
-    if not submission:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found.")
-    course = db.query(Course).filter(Course.id == submission.assignment.course_id).first()
-    check_course_ownership(course, current_user)
-
-    return SubmissionResponse(
-        id=submission.id,
-        assignment_id=submission.assignment_id,
-        student_id=submission.student_id,
-        student=StudentSummary(
-            id=submission.student.id,
-            full_name=submission.student.full_name,
-            email=submission.student.email,
-        )
-        if submission.student
-        else None,
-        submission_text=submission.submission_text,
-        attachments_json=submission.attachments_json,
-        status=submission.status,
-        is_late=submission.is_late,
-        submitted_at=submission.submitted_at,
-        updated_at=submission.updated_at,
-        grade=submission.grade,
-        feedback=submission.feedback,
-        graded_by_id=submission.graded_by_id,
-        graded_at=submission.graded_at,
-        assignment_title=submission.assignment.title,
-        max_marks=submission.assignment.max_marks,
-    )
+    return get_submission_detail_for_instructor(mongo_db, submission_id, current_user)
 
 
 @router.put(
@@ -1244,7 +1348,14 @@ def get_submission_detail(
 def grade_student_submission(
     submission_id: int,
     grade_in: SubmissionGradePayload,
-    current_user: User = Depends(require_instructor),
+    current_user: MongoUser = Depends(require_instructor),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return service_grade_submission(db, submission_id, grade_in, current_user)
+    return service_grade_submission(
+        mongo_db,
+        submission_id,
+        grade_in,
+        current_user,
+        sqlite_db=db,
+    )

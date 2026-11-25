@@ -1,15 +1,18 @@
 import csv
 import io
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.user import User, UserRole
+from app.models.user import UserRole
+from app.repositories.course_repository import (
+    list_all_courses,
+    list_enrollments,
+    list_lesson_progress,
+    list_lessons_by_course_ids,
+)
+from app.repositories.user_repository import list_all_users
 from app.schemas.admin_analytics import (
     AdminAnalyticsActivity,
     AdminAnalyticsDashboard,
@@ -26,6 +29,14 @@ from app.schemas.admin_analytics import (
 )
 
 
+def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _validated_range(
     start_date: Optional[date], end_date: Optional[date]
 ) -> Tuple[datetime, datetime, date, date]:
@@ -37,13 +48,16 @@ def _validated_range(
     if start > end:
         raise ValueError("start_date must be on or before end_date.")
 
-    start_at = datetime.combine(start, time.min)
-    end_exclusive = datetime.combine(end + timedelta(days=1), time.min)
+    start_at = datetime.combine(start, time.min, tzinfo=timezone.utc)
+    end_exclusive = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc)
     return start_at, end_exclusive, start, end
 
 
-def _range_filter(query, column, start_at: datetime, end_exclusive: datetime):
-    return query.filter(column >= start_at, column < end_exclusive)
+def _in_range(dt: Optional[datetime], start_at: datetime, end_exclusive: datetime) -> bool:
+    utc_dt = _ensure_utc(dt)
+    if utc_dt is None:
+        return False
+    return start_at <= utc_dt < end_exclusive
 
 
 def _month_keys(start: date, end: date):
@@ -57,83 +71,65 @@ def _month_keys(start: date, end: date):
 
 
 def build_admin_analytics(
-    db: Session,
+    mongo_db: Database,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
 ) -> AdminAnalyticsDashboard:
     start_at, end_exclusive, start, end = _validated_range(start_date, end_date)
 
-    total_students = db.query(func.count(User.id)).filter(
-        User.role == UserRole.STUDENT.value
-    ).scalar() or 0
-    total_instructors = db.query(func.count(User.id)).filter(
-        User.role == UserRole.INSTRUCTOR.value
-    ).scalar() or 0
-    total_active_users = db.query(func.count(User.id)).filter(
-        User.is_active.is_(True)
-    ).scalar() or 0
+    users = list_all_users(mongo_db)
+    users_by_id = {u.id: u for u in users}
+    students = [u for u in users if u.role == UserRole.STUDENT.value]
+    instructors = [u for u in users if u.role == UserRole.INSTRUCTOR.value]
 
-    total_courses = db.query(func.count(Course.id)).scalar() or 0
-    published_courses = db.query(func.count(Course.id)).filter(
-        Course.is_published.is_(True)
-    ).scalar() or 0
+    total_students = len(students)
+    total_instructors = len(instructors)
+    total_active_users = sum(1 for u in users if u.is_active)
 
-    period_enrollment_rows = db.query(
-        CourseEnrollment.course_id,
-        func.count(CourseEnrollment.id).label("enrollment_count"),
-        func.sum(case((CourseEnrollment.completion_percentage >= 100, 1), else_=0)).label(
-            "completed_count"
-        ),
-    )
-    period_enrollment_rows = _range_filter(
-        period_enrollment_rows, CourseEnrollment.enrolled_at, start_at, end_exclusive
-    )
-    period_enrollment_rows = period_enrollment_rows.group_by(CourseEnrollment.course_id).all()
-    course_enrollments = {
-        row.course_id: (int(row.enrollment_count or 0), int(row.completed_count or 0))
-        for row in period_enrollment_rows
-    }
-    total_enrollments = sum(count for count, _ in course_enrollments.values())
-    completed_enrollments = sum(count for _, count in course_enrollments.values())
+    courses = list_all_courses(mongo_db)
+    courses_by_id = {c.id: c for c in courses}
+    total_courses = len(courses)
+    published_courses = sum(1 for c in courses if c.is_published)
 
-    active_students = db.query(func.count(User.id)).filter(
-        User.role == UserRole.STUDENT.value, User.is_active.is_(True)
-    ).scalar() or 0
-    inactive_students = db.query(func.count(User.id)).filter(
-        User.role == UserRole.STUDENT.value, User.is_active.is_(False)
-    ).scalar() or 0
-    new_student_registrations = _range_filter(
-        db.query(func.count(User.id)).filter(User.role == UserRole.STUDENT.value),
-        User.created_at,
-        start_at,
-        end_exclusive,
-    ).scalar() or 0
+    all_enrollments = list_enrollments(mongo_db)
+    period_enrollments = [
+        e for e in all_enrollments if _in_range(e.enrolled_at, start_at, end_exclusive)
+    ]
 
-    student_enrollment_rows = db.query(
-        User.full_name,
-        func.count(CourseEnrollment.id).label("enrollment_count"),
-        func.coalesce(func.avg(CourseEnrollment.completion_percentage), 0.0).label(
-            "average_completion"
-        ),
-    ).join(CourseEnrollment, CourseEnrollment.student_id == User.id)
-    student_enrollment_rows = _range_filter(
-        student_enrollment_rows, CourseEnrollment.enrolled_at, start_at, end_exclusive
+    course_enrollments: Dict[int, List[int]] = {}
+    for e in period_enrollments:
+        entry = course_enrollments.setdefault(e.course_id, [0, 0])
+        entry[0] += 1
+        if e.completion_percentage >= 100:
+            entry[1] += 1
+    total_enrollments = len(period_enrollments)
+    completed_enrollments = sum(1 for e in period_enrollments if e.completion_percentage >= 100)
+
+    active_students = sum(1 for s in students if s.is_active)
+    inactive_students = sum(1 for s in students if not s.is_active)
+    new_student_registrations = sum(
+        1 for s in students if _in_range(s.created_at, start_at, end_exclusive)
     )
-    student_enrollment_rows = (
-        student_enrollment_rows.filter(User.role == UserRole.STUDENT.value)
-        .group_by(User.id, User.full_name)
-        .all()
-    )
+
+    student_enr_buckets: Dict[int, List[float]] = {}
+    for e in period_enrollments:
+        student_user = users_by_id.get(e.student_id)
+        if student_user and student_user.role == UserRole.STUDENT.value:
+            student_enr_buckets.setdefault(e.student_id, []).append(
+                float(e.completion_percentage)
+            )
     student_metrics = [
         StudentMetric(
-            name=row.full_name,
-            enrollment_count=int(row.enrollment_count),
-            average_completion_rate=round(float(row.average_completion or 0.0), 1),
+            name=users_by_id[sid].full_name,
+            enrollment_count=len(pcts),
+            average_completion_rate=round(sum(pcts) / len(pcts), 1),
         )
-        for row in student_enrollment_rows
+        for sid, pcts in student_enr_buckets.items()
     ]
     top_students = sorted(
-        student_metrics, key=lambda item: (item.enrollment_count, item.average_completion_rate), reverse=True
+        student_metrics,
+        key=lambda item: (item.enrollment_count, item.average_completion_rate),
+        reverse=True,
     )[:10]
     highest_completion_students = sorted(
         (item for item in student_metrics if item.enrollment_count),
@@ -142,22 +138,20 @@ def build_admin_analytics(
     )[:10]
     distinct_enrolled_students = len(student_metrics)
 
-    course_rows = (
-        db.query(Course, User.full_name)
-        .join(User, User.id == Course.instructor_id)
-        .order_by(Course.title)
-        .all()
-    )
-    category_counts = {}
-    course_metrics = []
-    for course, instructor_name in course_rows:
+    sorted_courses = sorted(courses, key=lambda c: c.title)
+    category_counts: Dict[str, int] = {}
+    course_metrics: List[CourseMetric] = []
+    for course in sorted_courses:
+        inst = users_by_id.get(course.instructor_id)
+        if not inst:
+            continue
         category_counts[course.category] = category_counts.get(course.category, 0) + 1
-        enrollment_count, completed_count = course_enrollments.get(course.id, (0, 0))
+        enrollment_count, completed_count = course_enrollments.get(course.id, [0, 0])
         course_metrics.append(
             CourseMetric(
                 course_id=course.id,
                 course_name=course.title,
-                instructor_name=instructor_name,
+                instructor_name=inst.full_name,
                 category=course.category,
                 is_published=course.is_published,
                 enrollment_count=enrollment_count,
@@ -173,10 +167,13 @@ def build_admin_analytics(
         for category, count in sorted(category_counts.items())
     ]
     most_popular_courses = sorted(
-        course_metrics, key=lambda item: (item.enrollment_count, item.course_name.lower()), reverse=True
+        course_metrics,
+        key=lambda item: (item.enrollment_count, item.course_name.lower()),
+        reverse=True,
     )[:10]
     least_enrolled_courses = sorted(
-        course_metrics, key=lambda item: (item.enrollment_count, item.course_name.lower())
+        course_metrics,
+        key=lambda item: (item.enrollment_count, item.course_name.lower()),
     )[:10]
     highest_completion_courses = sorted(
         (item for item in course_metrics if item.enrollment_count),
@@ -184,43 +181,30 @@ def build_admin_analytics(
         reverse=True,
     )[:10]
 
-    instructor_course_rows = db.query(
-        Course.instructor_id,
-        func.count(Course.id).label("course_count"),
-    ).group_by(Course.instructor_id).all()
-    instructor_enrollment_rows = db.query(
-        Course.instructor_id,
-        func.count(CourseEnrollment.id).label("enrollment_count"),
-    ).join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
-    instructor_enrollment_rows = _range_filter(
-        instructor_enrollment_rows,
-        CourseEnrollment.enrolled_at,
-        start_at,
-        end_exclusive,
-    ).group_by(Course.instructor_id).all()
-    period_course_rows = db.query(
-        Course.instructor_id, func.count(Course.id).label("course_count")
-    )
-    period_course_rows = _range_filter(
-        period_course_rows, Course.created_at, start_at, end_exclusive
-    ).group_by(Course.instructor_id).all()
-    all_instructors = db.query(User).filter(
-        User.role == UserRole.INSTRUCTOR.value
-    ).order_by(User.full_name).all()
-    all_course_counts = {row.instructor_id: int(row.course_count) for row in instructor_course_rows}
-    period_enrollment_counts = {
-        row.instructor_id: int(row.enrollment_count) for row in instructor_enrollment_rows
-    }
-    period_course_counts = {row.instructor_id: int(row.course_count) for row in period_course_rows}
-    all_enrollment_counts = {
-        row.instructor_id: int(row.enrollment_count)
-        for row in db.query(
-            Course.instructor_id, func.count(CourseEnrollment.id).label("enrollment_count")
+    all_course_counts: Dict[int, int] = {}
+    period_course_counts: Dict[int, int] = {}
+    for c in courses:
+        all_course_counts[c.instructor_id] = all_course_counts.get(c.instructor_id, 0) + 1
+        if _in_range(c.created_at, start_at, end_exclusive):
+            period_course_counts[c.instructor_id] = (
+                period_course_counts.get(c.instructor_id, 0) + 1
+            )
+
+    all_enrollment_counts: Dict[int, int] = {}
+    period_enrollment_counts: Dict[int, int] = {}
+    for e in all_enrollments:
+        course = courses_by_id.get(e.course_id)
+        if not course:
+            continue
+        all_enrollment_counts[course.instructor_id] = (
+            all_enrollment_counts.get(course.instructor_id, 0) + 1
         )
-        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
-        .group_by(Course.instructor_id)
-        .all()
-    }
+        if _in_range(e.enrolled_at, start_at, end_exclusive):
+            period_enrollment_counts[course.instructor_id] = (
+                period_enrollment_counts.get(course.instructor_id, 0) + 1
+            )
+
+    all_instructors = sorted(instructors, key=lambda u: u.full_name)
     instructor_metrics = [
         InstructorMetric(
             name=instructor.full_name,
@@ -236,44 +220,30 @@ def build_admin_analytics(
         reverse=True,
     )
 
-    student_registration_by_month = dict(
-        _range_filter(
-            db.query(func.strftime("%Y-%m", User.created_at), func.count(User.id))
-            .filter(User.role == UserRole.STUDENT.value),
-            User.created_at,
-            start_at,
-            end_exclusive,
-        )
-        .group_by(func.strftime("%Y-%m", User.created_at))
-        .all()
-    )
-    enrollment_by_month = dict(
-        _range_filter(
-            db.query(
-                func.strftime("%Y-%m", CourseEnrollment.enrolled_at),
-                func.count(CourseEnrollment.id),
-            ),
-            CourseEnrollment.enrolled_at,
-            start_at,
-            end_exclusive,
-        )
-        .group_by(func.strftime("%Y-%m", CourseEnrollment.enrolled_at))
-        .all()
-    )
-    activity_by_month = dict(
-        _range_filter(
-            db.query(
-                func.strftime("%Y-%m", LessonProgress.updated_at),
-                func.count(func.distinct(LessonProgress.student_id)),
-            )
-            .join(Lesson, Lesson.id == LessonProgress.lesson_id),
-            LessonProgress.updated_at,
-            start_at,
-            end_exclusive,
-        )
-        .group_by(func.strftime("%Y-%m", LessonProgress.updated_at))
-        .all()
-    )
+    student_registration_by_month: Dict[str, int] = {}
+    for s in students:
+        if _in_range(s.created_at, start_at, end_exclusive):
+            m = _ensure_utc(s.created_at).strftime("%Y-%m")
+            student_registration_by_month[m] = student_registration_by_month.get(m, 0) + 1
+
+    enrollment_by_month: Dict[str, int] = {}
+    for e in period_enrollments:
+        m = _ensure_utc(e.enrolled_at).strftime("%Y-%m")
+        enrollment_by_month[m] = enrollment_by_month.get(m, 0) + 1
+
+    all_lessons = list_lessons_by_course_ids(mongo_db, [c.id for c in courses])
+    lesson_to_course = {l.id: l.course_id for l in all_lessons}
+    all_progress = list_lesson_progress(mongo_db)
+
+    active_students_by_month: Dict[str, set] = {}
+    for lp in all_progress:
+        if lp.lesson_id not in lesson_to_course:
+            continue
+        if _in_range(lp.updated_at, start_at, end_exclusive):
+            m = _ensure_utc(lp.updated_at).strftime("%Y-%m")
+            active_students_by_month.setdefault(m, set()).add(lp.student_id)
+    activity_by_month = {m: len(sids) for m, sids in active_students_by_month.items()}
+
     trends = AdminAnalyticsTrends(
         monthly=[
             MonthlyAnalyticsPoint(
@@ -286,15 +256,14 @@ def build_admin_analytics(
         ]
     )
 
-    activities = []
+    activities: List[AdminAnalyticsActivity] = []
 
-    def add_user_registrations(role: str, activity_type: str, activity_name: str):
-        rows = _range_filter(
-            db.query(User).filter(User.role == role),
-            User.created_at,
-            start_at,
-            end_exclusive,
-        ).order_by(User.created_at.desc()).limit(20).all()
+    def add_user_registrations(role_users: List, activity_type: str, activity_name: str):
+        rows = sorted(
+            (u for u in role_users if _in_range(u.created_at, start_at, end_exclusive)),
+            key=lambda u: _ensure_utc(u.created_at) or start_at,
+            reverse=True,
+        )[:20]
         activities.extend(
             AdminAnalyticsActivity(
                 activity_type=activity_type,
@@ -305,72 +274,77 @@ def build_admin_analytics(
             for user in rows
         )
 
-    add_user_registrations(
-        UserRole.STUDENT.value, "student_registered", "Student registered"
-    )
-    add_user_registrations(
-        UserRole.INSTRUCTOR.value, "instructor_registered", "Instructor registered"
-    )
+    add_user_registrations(students, "student_registered", "Student registered")
+    add_user_registrations(instructors, "instructor_registered", "Instructor registered")
 
-    recent_courses = _range_filter(
-        db.query(Course, User.full_name)
-        .join(User, User.id == Course.instructor_id),
-        Course.created_at,
-        start_at,
-        end_exclusive,
-    ).order_by(Course.created_at.desc()).limit(20).all()
+    recent_courses = sorted(
+        (
+            c
+            for c in courses
+            if c.instructor_id in users_by_id and _in_range(c.created_at, start_at, end_exclusive)
+        ),
+        key=lambda c: _ensure_utc(c.created_at) or start_at,
+        reverse=True,
+    )[:20]
     activities.extend(
         AdminAnalyticsActivity(
             activity_type="course_created",
             activity_name=f"Course created: {course.title}",
-            user_name=instructor_name,
+            user_name=users_by_id[course.instructor_id].full_name,
             date=course.created_at,
         )
-        for course, instructor_name in recent_courses
+        for course in recent_courses
     )
 
-    recent_enrollments = _range_filter(
-        db.query(CourseEnrollment, User.full_name, Course.title)
-        .join(User, User.id == CourseEnrollment.student_id)
-        .join(Course, Course.id == CourseEnrollment.course_id),
-        CourseEnrollment.enrolled_at,
-        start_at,
-        end_exclusive,
-    ).order_by(CourseEnrollment.enrolled_at.desc()).limit(20).all()
+    recent_enrollments = sorted(
+        (
+            e
+            for e in period_enrollments
+            if e.student_id in users_by_id and e.course_id in courses_by_id
+        ),
+        key=lambda e: _ensure_utc(e.enrolled_at) or start_at,
+        reverse=True,
+    )[:20]
     activities.extend(
         AdminAnalyticsActivity(
             activity_type="course_enrolled",
-            activity_name=f"Enrolled in course: {course_name}",
-            user_name=student_name,
-            date=enrollment.enrolled_at,
+            activity_name=f"Enrolled in course: {courses_by_id[e.course_id].title}",
+            user_name=users_by_id[e.student_id].full_name,
+            date=e.enrolled_at,
         )
-        for enrollment, student_name, course_name in recent_enrollments
+        for e in recent_enrollments
     )
 
-    completed_rows = (
-        db.query(
-            User.full_name,
-            Course.title,
-            func.max(LessonProgress.completed_at).label("completed_at"),
-        )
-        .join(CourseEnrollment, CourseEnrollment.student_id == User.id)
-        .join(Course, Course.id == CourseEnrollment.course_id)
-        .join(Lesson, Lesson.course_id == Course.id)
-        .join(
-            LessonProgress,
-            (LessonProgress.lesson_id == Lesson.id)
-            & (LessonProgress.student_id == User.id),
-        )
-        .filter(
-            CourseEnrollment.completion_percentage >= 100,
-            LessonProgress.is_completed.is_(True),
-            LessonProgress.completed_at.isnot(None),
-        )
-        .group_by(User.id, User.full_name, Course.id, Course.title)
-    )
-    completed_rows = _range_filter(
-        completed_rows, LessonProgress.completed_at, start_at, end_exclusive
-    ).order_by(func.max(LessonProgress.completed_at).desc()).limit(20).all()
+    completed_pairs = {
+        (e.student_id, e.course_id)
+        for e in all_enrollments
+        if e.completion_percentage >= 100
+        and e.student_id in users_by_id
+        and e.course_id in courses_by_id
+    }
+    max_completed_by_pair: Dict[Tuple[int, int], datetime] = {}
+    for lp in all_progress:
+        if not lp.is_completed or lp.completed_at is None:
+            continue
+        cid = lesson_to_course.get(lp.lesson_id)
+        if cid is None:
+            continue
+        pair = (lp.student_id, cid)
+        if pair not in completed_pairs:
+            continue
+        comp_dt = _ensure_utc(lp.completed_at)
+        if comp_dt and (pair not in max_completed_by_pair or comp_dt > max_completed_by_pair[pair]):
+            max_completed_by_pair[pair] = comp_dt
+
+    completed_rows = sorted(
+        (
+            (users_by_id[sid].full_name, courses_by_id[cid].title, dt)
+            for (sid, cid), dt in max_completed_by_pair.items()
+            if _in_range(dt, start_at, end_exclusive)
+        ),
+        key=lambda item: item[2],
+        reverse=True,
+    )[:20]
     activities.extend(
         AdminAnalyticsActivity(
             activity_type="course_completed",
@@ -380,7 +354,7 @@ def build_admin_analytics(
         )
         for student_name, course_name, completed_at in completed_rows
     )
-    activities.sort(key=lambda activity: activity.date, reverse=True)
+    activities.sort(key=lambda activity: _ensure_utc(activity.date) or start_at, reverse=True)
 
     return AdminAnalyticsDashboard(
         overview=AdminAnalyticsOverview(

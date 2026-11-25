@@ -1,9 +1,11 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db
+from app.repositories.assignment_repository import get_assignment_by_id
+from app.repositories.user_repository import MongoUser
 from app.schemas.assignment import (
     AssignmentDetailResponse,
     AssignmentResponse,
@@ -19,7 +21,6 @@ from app.services.assignment_service import (
 )
 from app.services.file_validator import validate_upload_content
 from app.services.storage import get_storage_provider
-from app.models.assignment import Assignment
 
 router = APIRouter(prefix="/assignments", tags=["Assignments & Student Submissions"])
 
@@ -28,15 +29,15 @@ router = APIRouter(prefix="/assignments", tags=["Assignments & Student Submissio
 async def upload_assignment_attachment(
     assignment_id: int,
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    assignment = db.query(Assignment).filter(Assignment.id == assignment_id).first()
+    assignment = get_assignment_by_id(mongo_db, assignment_id)
     if assignment is None:
         raise HTTPException(status_code=404, detail="Assignment not found.")
     if current_user.role != "student":
         raise HTTPException(status_code=403, detail="Only enrolled students can upload assignment files.")
-    check_student_course_access(db, assignment.course_id, current_user)
+    check_student_course_access(mongo_db, assignment.course_id, current_user)
     if not assignment.is_published or assignment.is_archived or assignment.is_closed:
         raise HTTPException(status_code=400, detail="This assignment is not accepting submissions.")
     content = await file.read(10 * 1024 * 1024 + 1)
@@ -70,10 +71,10 @@ async def upload_assignment_attachment(
 )
 def get_course_assignments(
     course_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return list_course_assignments_for_student(db, course_id, current_user)
+    return list_course_assignments_for_student(mongo_db, course_id, current_user)
 
 
 @router.get(
@@ -83,10 +84,10 @@ def get_course_assignments(
 )
 def get_assignment(
     assignment_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_assignment_detail_for_student(db, assignment_id, current_user)
+    return get_assignment_detail_for_student(mongo_db, assignment_id, current_user)
 
 
 @router.post(
@@ -97,10 +98,17 @@ def get_assignment(
 def submit_assignment(
     assignment_id: int,
     submission_in: SubmissionCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return submit_student_assignment(db, assignment_id, submission_in, current_user)
+    return submit_student_assignment(
+        mongo_db,
+        assignment_id,
+        submission_in,
+        current_user,
+        sqlite_db=db,
+    )
 
 
 @router.get(
@@ -110,8 +118,7 @@ def submit_assignment(
 )
 def get_my_submission(
     assignment_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_student_submission(db, assignment_id, current_user)
-
+    return get_student_submission(mongo_db, assignment_id, current_user)

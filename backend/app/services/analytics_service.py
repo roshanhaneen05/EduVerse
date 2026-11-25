@@ -3,16 +3,34 @@ import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from fastapi import HTTPException, status
-from sqlalchemy import case, func
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
 
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.quiz import Question, Quiz, QuizAttempt
-from app.models.section import CourseSection
-from app.models.user import User
+from app.repositories.assignment_repository import (
+    list_assignments_by_course_ids,
+    list_submissions_by_assignment_ids,
+    list_submissions_for_student_assignments,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    get_course_by_id,
+    get_enrollment_by_student_and_course,
+    list_all_courses,
+    list_enrollments,
+    list_lesson_progress,
+    list_lessons_by_course_ids,
+    list_lessons_for_course,
+    list_sections_for_course,
+)
+from app.repositories.quiz_repository import (
+    count_questions_by_quiz_ids,
+    list_quiz_attempts,
+    list_quizzes_by_course_ids,
+)
+from app.repositories.user_repository import (
+    MongoUser,
+    get_user_by_id,
+    get_users_by_ids,
+)
 from app.schemas.analytics import (
     AssignmentAnalyticsItem,
     CourseAnalyticsResponse,
@@ -28,7 +46,15 @@ from app.schemas.analytics import (
 )
 
 
-def _check_course_ownership(course: Course, user: User) -> None:
+def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _check_course_ownership(course: MongoCourse, user: MongoUser) -> None:
     """Ensure current user is course instructor or platform administrator."""
     if user.role == "admin":
         return
@@ -49,7 +75,6 @@ def _sanitize_csv_cell(value: any) -> str:
     val_str = str(value)
     if val_str and val_str[0] in ("=", "+", "-", "@", "\t", "\r"):
         return f"'{val_str}"
-    # Also check if leading spaces precede a formula trigger
     stripped = val_str.lstrip(" ")
     if stripped and stripped[0] in ("=", "+", "-", "@", "\t", "\r"):
         return f"'{val_str}"
@@ -57,14 +82,14 @@ def _sanitize_csv_cell(value: any) -> str:
 
 
 def get_instructor_dashboard_analytics(
-    db: Session,
-    current_user: User,
+    mongo_db: Database,
+    current_user: MongoUser,
 ) -> EnhancedInstructorDashboardStats:
     """Aggregate high-level faculty metrics across all instructor-managed courses."""
-    course_query = db.query(Course)
-    if current_user.role != "admin":
-        course_query = course_query.filter(Course.instructor_id == current_user.id)
-    managed_courses = course_query.order_by(Course.created_at.desc()).all()
+    managed_courses = list_all_courses(
+        mongo_db,
+        instructor_id=None if current_user.role == "admin" else current_user.id,
+    )
     course_ids = [c.id for c in managed_courses]
 
     if not course_ids:
@@ -87,110 +112,94 @@ def get_instructor_dashboard_analytics(
         )
 
     published_courses = sum(1 for c in managed_courses if c.is_published)
+    course_map = {c.id: c for c in managed_courses}
 
-    # Enrollments & students
-    enrollments_query = db.query(CourseEnrollment).filter(CourseEnrollment.course_id.in_(course_ids))
-    total_enrollments = enrollments_query.count()
-    unique_students = (
-        db.query(func.count(func.distinct(CourseEnrollment.student_id)))
-        .filter(CourseEnrollment.course_id.in_(course_ids))
-        .scalar()
-        or 0
-    )
-    completed_enrollments = (
-        db.query(func.count(CourseEnrollment.id))
-        .filter(CourseEnrollment.course_id.in_(course_ids), CourseEnrollment.completion_percentage >= 100.0)
-        .scalar()
-        or 0
-    )
+    enrollments = list_enrollments(mongo_db, course_ids=course_ids, sort_desc=True)
+    total_enrollments = len(enrollments)
+    unique_students = len({e.student_id for e in enrollments})
+    completed_enrollments = sum(1 for e in enrollments if e.completion_percentage >= 100.0)
     avg_progress = (
-        db.query(func.coalesce(func.avg(CourseEnrollment.completion_percentage), 0.0))
-        .filter(CourseEnrollment.course_id.in_(course_ids))
-        .scalar()
-        or 0.0
+        sum(e.completion_percentage for e in enrollments) / total_enrollments
+        if total_enrollments > 0
+        else 0.0
     )
 
-    # Assignments & submissions
-    assignments = db.query(Assignment).filter(Assignment.course_id.in_(course_ids), Assignment.is_archived == False).all()
+    assignments = list_assignments_by_course_ids(
+        mongo_db, course_ids, exclude_archived=True
+    )
     total_assignments = len(assignments)
     assignment_ids = [a.id for a in assignments]
+    assignment_to_course = {a.id: a.course_id for a in assignments}
 
-    total_submissions = 0
-    pending_grading = 0
-    if assignment_ids:
-        total_submissions = (
-            db.query(func.count(AssignmentSubmission.id))
-            .filter(AssignmentSubmission.assignment_id.in_(assignment_ids))
-            .scalar()
-            or 0
-        )
-        pending_grading = (
-            db.query(func.count(AssignmentSubmission.id))
-            .filter(
-                AssignmentSubmission.assignment_id.in_(assignment_ids),
-                AssignmentSubmission.status == "submitted",
-            )
-            .scalar()
-            or 0
-        )
+    submissions = list_submissions_by_assignment_ids(mongo_db, assignment_ids)
+    total_submissions = len(submissions)
+    pending_grading = sum(1 for s in submissions if s.status == "submitted")
 
-    # Quizzes & attempts
-    quizzes = db.query(Quiz).filter(Quiz.course_id.in_(course_ids)).all()
+    quizzes = list_quizzes_by_course_ids(mongo_db, course_ids)
     total_quizzes = len(quizzes)
     quiz_ids = [q.id for q in quizzes]
 
-    total_quiz_attempts = 0
-    avg_quiz_score = 0.0
-    if quiz_ids:
-        attempts_stats = (
-            db.query(
-                func.count(QuizAttempt.id),
-                func.coalesce(func.avg(QuizAttempt.score), 0.0),
-            )
-            .filter(QuizAttempt.quiz_id.in_(quiz_ids), QuizAttempt.is_completed == True)
-            .first()
-        )
-        if attempts_stats:
-            total_quiz_attempts = attempts_stats[0] or 0
-            avg_quiz_score = round(float(attempts_stats[1] or 0.0), 1)
-
-    # Recent enrollments
-    recent_enrollments_db = (
-        db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.student), joinedload(CourseEnrollment.course))
-        .filter(CourseEnrollment.course_id.in_(course_ids))
-        .order_by(CourseEnrollment.enrolled_at.desc())
-        .limit(5)
-        .all()
+    quiz_attempts = list_quiz_attempts(
+        mongo_db, quiz_ids=quiz_ids, completed_only=True
     )
-    recent_enrollments = [
-        {
-            "enrollment_id": e.id,
-            "student_name": e.student.full_name if e.student else "Unknown",
-            "student_email": e.student.email if e.student else "",
-            "course_title": e.course.title if e.course else "",
-            "completion_percentage": e.completion_percentage,
-            "enrolled_at": e.enrolled_at.isoformat(),
-        }
-        for e in recent_enrollments_db
-    ]
+    total_quiz_attempts = len(quiz_attempts)
+    avg_quiz_score = (
+        round(sum(a.score for a in quiz_attempts) / total_quiz_attempts, 1)
+        if total_quiz_attempts > 0
+        else 0.0
+    )
 
-    # Per-course overview
+    recent_enrollments_db = enrollments[:5]
+    recent_students_map = get_users_by_ids(
+        mongo_db, [e.student_id for e in recent_enrollments_db]
+    )
+    recent_enrollments = []
+    for e in recent_enrollments_db:
+        student = recent_students_map.get(e.student_id)
+        course = course_map.get(e.course_id)
+        recent_enrollments.append(
+            {
+                "enrollment_id": e.id,
+                "student_name": student.full_name if student else "Unknown",
+                "student_email": student.email if student else "",
+                "course_title": course.title if course else "",
+                "completion_percentage": e.completion_percentage,
+                "enrolled_at": e.enrolled_at.isoformat(),
+            }
+        )
+
+    lessons_all = list_lessons_by_course_ids(mongo_db, course_ids)
+    lessons_by_course: Dict[int, int] = {}
+    for l in lessons_all:
+        lessons_by_course[l.course_id] = lessons_by_course.get(l.course_id, 0) + 1
+
+    enrollments_by_course: Dict[int, list] = {}
+    for e in enrollments:
+        enrollments_by_course.setdefault(e.course_id, []).append(e)
+
+    assignments_by_course: Dict[int, int] = {}
+    for a in assignments:
+        assignments_by_course[a.course_id] = assignments_by_course.get(a.course_id, 0) + 1
+
+    quizzes_by_course: Dict[int, int] = {}
+    for q in quizzes:
+        quizzes_by_course[q.course_id] = quizzes_by_course.get(q.course_id, 0) + 1
+
+    pending_by_course: Dict[int, int] = {}
+    for s in submissions:
+        if s.status == "submitted":
+            cid = assignment_to_course.get(s.assignment_id)
+            if cid is not None:
+                pending_by_course[cid] = pending_by_course.get(cid, 0) + 1
+
     courses_overview = []
     for c in managed_courses:
-        c_students = db.query(func.count(CourseEnrollment.id)).filter(CourseEnrollment.course_id == c.id).scalar() or 0
-        c_lessons = db.query(func.count(Lesson.id)).filter(Lesson.course_id == c.id).scalar() or 0
-        c_assignments = db.query(func.count(Assignment.id)).filter(Assignment.course_id == c.id, Assignment.is_archived == False).scalar() or 0
-        c_quizzes = db.query(func.count(Quiz.id)).filter(Quiz.course_id == c.id).scalar() or 0
-        c_avg_prog = db.query(func.coalesce(func.avg(CourseEnrollment.completion_percentage), 0.0)).filter(CourseEnrollment.course_id == c.id).scalar() or 0.0
-        c_completed = db.query(func.count(CourseEnrollment.id)).filter(CourseEnrollment.course_id == c.id, CourseEnrollment.completion_percentage >= 100.0).scalar() or 0
-        c_pending = (
-            db.query(func.count(AssignmentSubmission.id))
-            .join(Assignment, AssignmentSubmission.assignment_id == Assignment.id)
-            .filter(Assignment.course_id == c.id, AssignmentSubmission.status == "submitted")
-            .scalar()
-            or 0
+        c_enrs = enrollments_by_course.get(c.id, [])
+        c_students = len(c_enrs)
+        c_avg_prog = (
+            sum(e.completion_percentage for e in c_enrs) / c_students if c_students > 0 else 0.0
         )
+        c_completed = sum(1 for e in c_enrs if e.completion_percentage >= 100.0)
         c_rate = round((c_completed / c_students * 100.0), 1) if c_students > 0 else 0.0
 
         courses_overview.append(
@@ -201,16 +210,20 @@ def get_instructor_dashboard_analytics(
                 difficulty=c.difficulty,
                 is_published=c.is_published,
                 student_count=c_students,
-                lesson_count=c_lessons,
-                assignment_count=c_assignments,
-                quiz_count=c_quizzes,
+                lesson_count=lessons_by_course.get(c.id, 0),
+                assignment_count=assignments_by_course.get(c.id, 0),
+                quiz_count=quizzes_by_course.get(c.id, 0),
                 average_progress=round(float(c_avg_prog), 1),
                 completion_rate=c_rate,
-                pending_grading_count=c_pending,
+                pending_grading_count=pending_by_course.get(c.id, 0),
             )
         )
 
-    completion_rate = round((completed_enrollments / total_enrollments * 100.0), 1) if total_enrollments > 0 else 0.0
+    completion_rate = (
+        round((completed_enrollments / total_enrollments * 100.0), 1)
+        if total_enrollments > 0
+        else 0.0
+    )
 
     return EnhancedInstructorDashboardStats(
         total_courses=len(managed_courses),
@@ -232,34 +245,42 @@ def get_instructor_dashboard_analytics(
 
 
 def get_course_analytics(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
-    current_user: User,
+    current_user: MongoUser,
 ) -> CourseAnalyticsResponse:
     """Retrieve detailed, real-time analytics for a specific course."""
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_ownership(course, current_user)
 
-    # 1. Students & completion metrics
-    enrollments = db.query(CourseEnrollment).filter(CourseEnrollment.course_id == course_id).all()
+    enrollments = list_enrollments(mongo_db, course_ids=[course_id])
     total_students = len(enrollments)
     completed_students = sum(1 for e in enrollments if e.completion_percentage >= 100.0)
-    avg_completion = round(sum(e.completion_percentage for e in enrollments) / total_students, 1) if total_students > 0 else 0.0
-    completion_rate = round((completed_students / total_students) * 100.0, 1) if total_students > 0 else 0.0
+    avg_completion = (
+        round(sum(e.completion_percentage for e in enrollments) / total_students, 1)
+        if total_students > 0
+        else 0.0
+    )
+    completion_rate = (
+        round((completed_students / total_students) * 100.0, 1) if total_students > 0 else 0.0
+    )
 
-    # 2. Lessons
-    total_lessons = db.query(func.count(Lesson.id)).filter(Lesson.course_id == course_id).scalar() or 0
+    lessons = list_lessons_for_course(mongo_db, course_id)
+    total_lessons = len(lessons)
 
-    # 3. Assignments breakdown
-    assignments = (
-        db.query(Assignment)
-        .filter(Assignment.course_id == course_id, Assignment.is_archived == False)
-        .order_by(Assignment.id.asc())
-        .all()
+    assignments = sorted(
+        list_assignments_by_course_ids(mongo_db, [course_id], exclude_archived=True),
+        key=lambda a: a.id,
     )
     total_assignments = len(assignments)
+    submissions_all = list_submissions_by_assignment_ids(
+        mongo_db, [a.id for a in assignments]
+    )
+    subs_by_assignment: Dict[int, list] = {}
+    for s in submissions_all:
+        subs_by_assignment.setdefault(s.assignment_id, []).append(s)
 
     assignments_breakdown = []
     total_submissions = 0
@@ -269,13 +290,17 @@ def get_course_analytics(
     graded_count_for_avg = 0
 
     for a in assignments:
-        subs = db.query(AssignmentSubmission).filter(AssignmentSubmission.assignment_id == a.id).all()
+        subs = subs_by_assignment.get(a.id, [])
         sub_count = len(subs)
         pending = sum(1 for s in subs if s.status == "submitted")
         graded = sum(1 for s in subs if s.status == "graded")
 
         grades = [s.grade for s in subs if s.grade is not None and a.max_marks > 0]
-        avg_grade = round(sum((g / a.max_marks * 100.0) for g in grades) / len(grades), 1) if grades else None
+        avg_grade = (
+            round(sum((g / a.max_marks * 100.0) for g in grades) / len(grades), 1)
+            if grades
+            else None
+        )
 
         total_submissions += sub_count
         pending_grading_total += pending
@@ -298,21 +323,28 @@ def get_course_analytics(
             )
         )
 
-    avg_assignment_grade = round(grades_sum / graded_count_for_avg, 1) if graded_count_for_avg > 0 else None
+    avg_assignment_grade = (
+        round(grades_sum / graded_count_for_avg, 1) if graded_count_for_avg > 0 else None
+    )
     max_possible_submissions = total_students * total_assignments
     assignment_submission_rate = (
-        round((total_submissions / max_possible_submissions) * 100.0, 1) if max_possible_submissions > 0 else 0.0
+        round((total_submissions / max_possible_submissions) * 100.0, 1)
+        if max_possible_submissions > 0
+        else 0.0
     )
 
-    # 4. Quizzes breakdown
-    quizzes = (
-        db.query(Quiz)
-        .options(joinedload(Quiz.questions))
-        .filter(Quiz.course_id == course_id)
-        .order_by(Quiz.id.asc())
-        .all()
+    quizzes = sorted(
+        list_quizzes_by_course_ids(mongo_db, [course_id]), key=lambda q: q.id
     )
     total_quizzes = len(quizzes)
+    question_counts = count_questions_by_quiz_ids(mongo_db, [q.id for q in quizzes])
+    attempts_all = list_quiz_attempts(
+        mongo_db, quiz_ids=[q.id for q in quizzes], completed_only=True
+    )
+    attempts_by_quiz: Dict[int, list] = {}
+    for att in attempts_all:
+        if att.quiz_id is not None:
+            attempts_by_quiz.setdefault(att.quiz_id, []).append(att)
 
     quizzes_breakdown = []
     total_quiz_attempts = 0
@@ -320,9 +352,9 @@ def get_course_analytics(
     all_scores = []
 
     for q in quizzes:
-        attempts = db.query(QuizAttempt).filter(QuizAttempt.quiz_id == q.id, QuizAttempt.is_completed == True).all()
+        attempts = attempts_by_quiz.get(q.id, [])
         att_count = len(attempts)
-        unique_att = len(set(a.student_id for a in attempts))
+        unique_att = len({a.student_id for a in attempts})
         passes = sum(1 for a in attempts if a.passed)
         fails = att_count - passes
         pass_rate = round((passes / att_count) * 100.0, 1) if att_count > 0 else 0.0
@@ -337,7 +369,7 @@ def get_course_analytics(
                 quiz_id=q.id,
                 quiz_title=q.title,
                 passing_score=q.passing_score,
-                total_questions=len(q.questions) if q.questions else 0,
+                total_questions=question_counts.get(q.id, 0),
                 time_limit_minutes=q.time_limit_minutes,
                 is_published=q.is_published,
                 total_attempts=att_count,
@@ -351,7 +383,9 @@ def get_course_analytics(
 
     avg_quiz_score = round(sum(all_scores) / len(all_scores), 1) if all_scores else 0.0
     overall_quiz_pass_rate = (
-        round((passed_attempts_total / total_quiz_attempts) * 100.0, 1) if total_quiz_attempts > 0 else 0.0
+        round((passed_attempts_total / total_quiz_attempts) * 100.0, 1)
+        if total_quiz_attempts > 0
+        else 0.0
     )
 
     return CourseAnalyticsResponse(
@@ -381,24 +415,17 @@ def get_course_analytics(
 
 
 def get_course_student_report(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
-    current_user: User,
+    current_user: MongoUser,
 ) -> CourseStudentReportResponse:
     """Generate a course-level student roster report with batch querying."""
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_ownership(course, current_user)
 
-    enrollments = (
-        db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.student))
-        .filter(CourseEnrollment.course_id == course_id)
-        .order_by(CourseEnrollment.enrolled_at.desc())
-        .all()
-    )
-
+    enrollments = list_enrollments(mongo_db, course_ids=[course_id], sort_desc=True)
     if not enrollments:
         return CourseStudentReportResponse(
             course_id=course.id,
@@ -409,60 +436,51 @@ def get_course_student_report(
         )
 
     student_ids = [e.student_id for e in enrollments]
+    students_map = get_users_by_ids(mongo_db, student_ids)
 
-    # Lessons
-    lessons = db.query(Lesson).filter(Lesson.course_id == course_id).all()
+    lessons = list_lessons_for_course(mongo_db, course_id)
     total_lessons = len(lessons)
     lesson_ids = [l.id for l in lessons]
 
     completed_lessons_by_student: Dict[int, int] = {}
     if lesson_ids:
-        progress_counts = (
-            db.query(LessonProgress.student_id, func.count(LessonProgress.id))
-            .filter(
-                LessonProgress.lesson_id.in_(lesson_ids),
-                LessonProgress.student_id.in_(student_ids),
-                LessonProgress.is_completed == True,
-            )
-            .group_by(LessonProgress.student_id)
-            .all()
+        progress_rows = list_lesson_progress(
+            mongo_db,
+            student_ids=student_ids,
+            lesson_ids=lesson_ids,
+            completed_only=True,
         )
-        completed_lessons_by_student = {p[0]: p[1] for p in progress_counts}
+        for lp in progress_rows:
+            completed_lessons_by_student[lp.student_id] = (
+                completed_lessons_by_student.get(lp.student_id, 0) + 1
+            )
 
-    # Assignments
-    assignments = db.query(Assignment).filter(Assignment.course_id == course_id, Assignment.is_archived == False).all()
+    assignments = list_assignments_by_course_ids(
+        mongo_db, [course_id], exclude_archived=True
+    )
     total_assignments = len(assignments)
     assignment_ids = [a.id for a in assignments]
     max_marks_map = {a.id: a.max_marks for a in assignments}
 
-    submissions_by_student: Dict[int, List[AssignmentSubmission]] = {sid: [] for sid in student_ids}
+    submissions_by_student: Dict[int, list] = {sid: [] for sid in student_ids}
     if assignment_ids:
-        subs = (
-            db.query(AssignmentSubmission)
-            .filter(
-                AssignmentSubmission.assignment_id.in_(assignment_ids),
-                AssignmentSubmission.student_id.in_(student_ids),
-            )
-            .all()
+        subs = list_submissions_by_assignment_ids(
+            mongo_db, assignment_ids, student_ids=student_ids
         )
         for s in subs:
             submissions_by_student.setdefault(s.student_id, []).append(s)
 
-    # Quizzes
-    quizzes = db.query(Quiz).filter(Quiz.course_id == course_id).all()
+    quizzes = list_quizzes_by_course_ids(mongo_db, [course_id])
     total_quizzes = len(quizzes)
     quiz_ids = [q.id for q in quizzes]
 
-    attempts_by_student: Dict[int, List[QuizAttempt]] = {sid: [] for sid in student_ids}
+    attempts_by_student: Dict[int, list] = {sid: [] for sid in student_ids}
     if quiz_ids:
-        atts = (
-            db.query(QuizAttempt)
-            .filter(
-                QuizAttempt.quiz_id.in_(quiz_ids),
-                QuizAttempt.student_id.in_(student_ids),
-                QuizAttempt.is_completed == True,
-            )
-            .all()
+        atts = list_quiz_attempts(
+            mongo_db,
+            quiz_ids=quiz_ids,
+            student_ids=student_ids,
+            completed_only=True,
         )
         for a in atts:
             attempts_by_student.setdefault(a.student_id, []).append(a)
@@ -472,7 +490,7 @@ def get_course_student_report(
 
     for enr in enrollments:
         sid = enr.student_id
-        student = enr.student
+        student = students_map.get(sid)
         if not student:
             continue
 
@@ -483,29 +501,30 @@ def get_course_student_report(
         submitted_assignments = len(s_subs)
         pending_grading = sum(1 for s in s_subs if s.status == "submitted")
 
-        # Average assignment percentage
-        graded_subs = [s for s in s_subs if s.grade is not None and max_marks_map.get(s.assignment_id, 0) > 0]
+        graded_subs = [
+            s for s in s_subs if s.grade is not None and max_marks_map.get(s.assignment_id, 0) > 0
+        ]
         avg_assign_grade = (
             round(
-                sum((s.grade / max_marks_map[s.assignment_id]) * 100.0 for s in graded_subs) / len(graded_subs), 1
+                sum((s.grade / max_marks_map[s.assignment_id]) * 100.0 for s in graded_subs)
+                / len(graded_subs),
+                1,
             )
             if graded_subs
             else None
         )
 
-        quizzes_taken = len(set(a.quiz_id for a in s_attempts))
-        quizzes_passed = len(set(a.quiz_id for a in s_attempts if a.passed))
+        quizzes_taken = len({a.quiz_id for a in s_attempts})
+        quizzes_passed = len({a.quiz_id for a in s_attempts if a.passed})
         avg_quiz_score = (
-            round(sum(a.score for a in s_attempts) / len(s_attempts), 1) if s_attempts else None
+            round(sum(a.score for a in s_attempts) / len(s_attempts), 1)
+            if s_attempts
+            else None
         )
 
-        # Clear, objective criteria for assistance indicators
         reasons = []
-        days_enrolled = (
-            (now - enr.enrolled_at.replace(tzinfo=timezone.utc if enr.enrolled_at.tzinfo is None else enr.enrolled_at.tzinfo)).days
-            if enr.enrolled_at
-            else 0
-        )
+        enrolled_utc = _ensure_utc(enr.enrolled_at)
+        days_enrolled = (now - enrolled_utc).days if enrolled_utc else 0
 
         if total_quizzes > 0 and s_attempts and quizzes_passed == 0:
             reasons.append("Failed all attempted assessments")
@@ -557,47 +576,35 @@ def get_course_student_report(
 
 
 def get_student_detailed_progress(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
     student_id: int,
-    current_user: User,
+    current_user: MongoUser,
 ) -> StudentDetailedProgressResponse:
     """Retrieve full curriculum breakdown, assignments, and quiz attempts for a specific student."""
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     _check_course_ownership(course, current_user)
 
-    student = db.query(User).filter(User.id == student_id).first()
+    student = get_user_by_id(mongo_db, student_id)
     if not student:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found.")
 
-    enrollment = (
-        db.query(CourseEnrollment)
-        .filter(CourseEnrollment.course_id == course_id, CourseEnrollment.student_id == student_id)
-        .first()
-    )
+    enrollment = get_enrollment_by_student_and_course(mongo_db, student_id, course_id)
     if not enrollment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Student is not enrolled in this course.",
         )
 
-    # 1. Lessons progress
-    lessons = (
-        db.query(Lesson)
-        .options(joinedload(Lesson.section))
-        .filter(Lesson.course_id == course_id)
-        .order_by(Lesson.order_index.asc())
-        .all()
-    )
+    sections_map = {s.id: s for s in list_sections_for_course(mongo_db, course_id)}
+    lessons = list_lessons_for_course(mongo_db, course_id)
     lesson_ids = [l.id for l in lessons]
     progress_map = {}
     if lesson_ids:
-        records = (
-            db.query(LessonProgress)
-            .filter(LessonProgress.student_id == student_id, LessonProgress.lesson_id.in_(lesson_ids))
-            .all()
+        records = list_lesson_progress(
+            mongo_db, student_id=student_id, lesson_ids=lesson_ids
         )
         progress_map = {r.lesson_id: r for r in records}
 
@@ -608,33 +615,28 @@ def get_student_detailed_progress(
         is_done = bool(prog and prog.is_completed)
         if is_done:
             completed_lessons_count += 1
+        section = sections_map.get(l.section_id) if l.section_id is not None else None
         lessons_detail.append(
             StudentLessonProgressDetail(
                 lesson_id=l.id,
                 title=l.title,
-                section_title=l.section.title if l.section else None,
+                section_title=section.title if section else None,
                 order_index=l.order_index,
                 is_completed=is_done,
                 completed_at=prog.completed_at if prog else None,
             )
         )
 
-    # 2. Assignments
-    assignments = (
-        db.query(Assignment)
-        .filter(Assignment.course_id == course_id, Assignment.is_archived == False)
-        .order_by(Assignment.id.asc())
-        .all()
+    assignments = sorted(
+        list_assignments_by_course_ids(mongo_db, [course_id], exclude_archived=True),
+        key=lambda a: a.id,
     )
     assign_ids = [a.id for a in assignments]
-    subs_map = {}
-    if assign_ids:
-        subs = (
-            db.query(AssignmentSubmission)
-            .filter(AssignmentSubmission.assignment_id.in_(assign_ids), AssignmentSubmission.student_id == student_id)
-            .all()
-        )
-        subs_map = {s.assignment_id: s for s in subs}
+    subs_map = (
+        list_submissions_for_student_assignments(mongo_db, student_id, assign_ids)
+        if assign_ids
+        else {}
+    )
 
     assignments_detail = []
     submitted_count = 0
@@ -663,23 +665,21 @@ def get_student_detailed_progress(
 
     avg_assign_grade = round(sum(grades) / len(grades), 1) if grades else None
 
-    # 3. Quizzes
-    quizzes = db.query(Quiz).filter(Quiz.course_id == course_id).order_by(Quiz.id.asc()).all()
+    quizzes = sorted(
+        list_quizzes_by_course_ids(mongo_db, [course_id]), key=lambda q: q.id
+    )
     quiz_ids = [q.id for q in quizzes]
     quiz_map = {q.id: q for q in quizzes}
 
     quiz_attempts_detail = []
     quiz_scores = []
     if quiz_ids:
-        attempts = (
-            db.query(QuizAttempt)
-            .filter(
-                QuizAttempt.quiz_id.in_(quiz_ids),
-                QuizAttempt.student_id == student_id,
-                QuizAttempt.is_completed == True,
-            )
-            .order_by(QuizAttempt.submitted_at.desc())
-            .all()
+        attempts = list_quiz_attempts(
+            mongo_db,
+            quiz_ids=quiz_ids,
+            student_id=student_id,
+            completed_only=True,
+            sort_desc=True,
         )
         for att in attempts:
             q = quiz_map.get(att.quiz_id)
@@ -698,9 +698,8 @@ def get_student_detailed_progress(
             )
 
     avg_quiz_score = round(sum(quiz_scores) / len(quiz_scores), 1) if quiz_scores else None
-    attempted_quizzes_count = len(set(a.quiz_id for a in quiz_attempts_detail))
+    attempted_quizzes_count = len({a.quiz_id for a in quiz_attempts_detail})
 
-    # Reasons & status
     reasons = []
     if len(quizzes) > 0 and quiz_attempts_detail and not any(a.passed for a in quiz_attempts_detail):
         reasons.append("Failed all attempted assessments")
@@ -741,20 +740,19 @@ def get_student_detailed_progress(
 
 
 def generate_student_report_csv(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
-    current_user: User,
+    current_user: MongoUser,
 ) -> str:
     """
     Generate CSV string of the student performance report.
     Applies formula-injection protection on all exported text fields.
     """
-    report = get_course_student_report(db, course_id, current_user)
+    report = get_course_student_report(mongo_db, course_id, current_user)
 
     output = io.StringIO()
     writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
 
-    # Header
     headers = [
         "Student ID",
         "Student Name",

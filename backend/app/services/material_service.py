@@ -1,20 +1,35 @@
-from datetime import datetime, timezone
-from typing import List, Optional, Tuple
-from fastapi import HTTPException, UploadFile, status
+from typing import Dict, List, Optional
+from fastapi import HTTPException, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson
-from app.models.material import LearningMaterial
-from app.models.section import CourseSection
-from app.models.user import User
+from app.repositories.course_repository import (
+    MongoCourse,
+    get_course_by_id,
+    get_enrollment_by_student_and_course,
+    get_lesson_by_id,
+    get_section_by_id,
+    list_lessons_for_course,
+    list_sections_for_course,
+)
+from app.repositories.material_repository import (
+    MongoLearningMaterial,
+    create_material_doc,
+    delete_material_doc,
+    delete_material_from_sqlite_shadow,
+    get_material_by_id,
+    list_materials_for_course,
+    restore_material_snapshot,
+    sync_material_to_sqlite_shadow,
+    update_material_doc,
+)
+from app.repositories.user_repository import MongoUser, get_user_by_id, get_users_by_ids
 from app.schemas.material import MaterialResponse, MaterialUpdate
 from app.services.file_validator import validate_upload_content
 from app.services.storage import get_storage_provider
 
 
-def check_course_ownership(course: Course, user: User):
+def check_course_ownership(course: MongoCourse, user: MongoUser) -> None:
     """Verify that current user is the course instructor or an administrator."""
     if user.role != "admin" and course.instructor_id != user.id:
         raise HTTPException(
@@ -23,28 +38,24 @@ def check_course_ownership(course: Course, user: User):
         )
 
 
-def check_course_material_access(db: Session, course_id: int, user: User) -> Course:
+def check_course_material_access(
+    mongo_db: Database,
+    course_id: int,
+    user: MongoUser,
+) -> MongoCourse:
     """
     Verify course exists and user has authorization to access materials:
     - Administrators: Allowed.
     - Course Instructor: Allowed.
     - Students: Must be actively enrolled in the course.
     """
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
 
     if user.role != "admin" and course.instructor_id != user.id:
-        enrollment = (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.student_id == user.id,
-                CourseEnrollment.course_id == course_id,
-                CourseEnrollment.status == "approved",
-            )
-            .first()
-        )
-        if not enrollment:
+        enrollment = get_enrollment_by_student_and_course(mongo_db, user.id, course_id)
+        if not enrollment or enrollment.status != "approved":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You must be enrolled in this course to access its learning materials.",
@@ -52,8 +63,36 @@ def check_course_material_access(db: Session, course_id: int, user: User) -> Cou
     return course
 
 
-def build_material_response(mat: LearningMaterial) -> MaterialResponse:
-    """Map LearningMaterial model to MaterialResponse with relational titles."""
+def build_material_response(
+    mongo_db: Database,
+    mat: MongoLearningMaterial,
+    *,
+    user_cache: Optional[Dict[int, MongoUser]] = None,
+    section_titles: Optional[Dict[int, str]] = None,
+    lesson_titles: Optional[Dict[int, str]] = None,
+) -> MaterialResponse:
+    """Map MongoLearningMaterial to MaterialResponse with relational titles."""
+    uploader = (
+        user_cache.get(mat.uploader_id)
+        if user_cache is not None
+        else get_user_by_id(mongo_db, mat.uploader_id)
+    )
+    section_title = None
+    if mat.section_id is not None:
+        if section_titles is not None:
+            section_title = section_titles.get(mat.section_id)
+        else:
+            sec = get_section_by_id(mongo_db, mat.section_id)
+            section_title = sec.title if sec else None
+
+    lesson_title = None
+    if mat.lesson_id is not None:
+        if lesson_titles is not None:
+            lesson_title = lesson_titles.get(mat.lesson_id)
+        else:
+            les = get_lesson_by_id(mongo_db, mat.lesson_id)
+            lesson_title = les.title if les else None
+
     return MaterialResponse(
         id=mat.id,
         course_id=mat.course_id,
@@ -65,16 +104,16 @@ def build_material_response(mat: LearningMaterial) -> MaterialResponse:
         mime_type=mat.mime_type,
         file_size=mat.file_size,
         uploader_id=mat.uploader_id,
-        uploader_name=mat.uploader.full_name if mat.uploader else None,
-        section_title=mat.section.title if mat.section else None,
-        lesson_title=mat.lesson.title if mat.lesson else None,
+        uploader_name=uploader.full_name if uploader else None,
+        section_title=section_title,
+        lesson_title=lesson_title,
         created_at=mat.created_at,
         updated_at=mat.updated_at,
     )
 
 
 def upload_course_material(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
     file_content: bytes,
     original_filename: str,
@@ -83,36 +122,34 @@ def upload_course_material(
     description: Optional[str],
     section_id: Optional[int],
     lesson_id: Optional[int],
-    current_user: User,
+    current_user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> MaterialResponse:
     """
-    Validate, securely store, and record a new course learning material.
-    Handles cleanup if database insertion fails to prevent orphaned files.
+    Validate, securely store, and record a new course learning material in MongoDB.
+    Handles cleanup if persistence fails to prevent orphaned files.
     """
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
-    # Validate section linking if provided
     if section_id:
-        sec = db.query(CourseSection).filter(
-            CourseSection.id == section_id,
-            CourseSection.course_id == course_id,
-        ).first()
-        if not sec:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected section does not belong to this course.")
+        sec = get_section_by_id(mongo_db, section_id)
+        if not sec or sec.course_id != course_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected section does not belong to this course.",
+            )
 
-    # Validate lesson linking if provided
     if lesson_id:
-        les = db.query(Lesson).filter(
-            Lesson.id == lesson_id,
-            Lesson.course_id == course_id,
-        ).first()
-        if not les:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected lesson does not belong to this course.")
+        les = get_lesson_by_id(mongo_db, lesson_id)
+        if not les or les.course_id != course_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected lesson does not belong to this course.",
+            )
 
-    # Server-side validation of content, MIME, magic bytes, and size
     clean_filename, canonical_mime, file_size, storage_key = validate_upload_content(
         filename=original_filename,
         content=file_content,
@@ -120,14 +157,14 @@ def upload_course_material(
     )
 
     storage = get_storage_provider()
-    # Save file to storage
     storage.save_file(storage_key, file_content)
 
-    # Persist record in database with transaction safety
+    material: Optional[MongoLearningMaterial] = None
     try:
-        material = LearningMaterial(
-            title=title.strip(),
-            description=description.strip() if description else None,
+        material = create_material_doc(
+            mongo_db,
+            title=title,
+            description=description,
             original_filename=clean_filename,
             storage_key=storage_key,
             mime_type=canonical_mime,
@@ -137,128 +174,164 @@ def upload_course_material(
             section_id=section_id,
             lesson_id=lesson_id,
         )
-        db.add(material)
-        db.commit()
-        db.refresh(material)
-    except Exception as e:
-        # If database persistence fails, clean up the written file to prevent disk leaks
-        db.rollback()
+        sync_material_to_sqlite_shadow(sqlite_db, material)
+    except Exception as exc:
+        if material is not None:
+            delete_material_doc(mongo_db, material.id)
         storage.delete_file(storage_key)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to record learning material: {str(e)}",
-        )
+            detail=f"Failed to record learning material: {str(exc)}",
+        ) from exc
 
-    return build_material_response(material)
+    return build_material_response(mongo_db, material)
 
 
 def list_course_materials(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
-    current_user: User,
+    current_user: MongoUser,
     section_id: Optional[int] = None,
     lesson_id: Optional[int] = None,
 ) -> List[MaterialResponse]:
     """List all authorized learning materials for a course."""
-    check_course_material_access(db, course_id, current_user)
+    check_course_material_access(mongo_db, course_id, current_user)
+    materials = list_materials_for_course(
+        mongo_db,
+        course_id,
+        section_id=section_id,
+        lesson_id=lesson_id,
+    )
+    if not materials:
+        return []
 
-    query = db.query(LearningMaterial).filter(LearningMaterial.course_id == course_id)
-    if section_id:
-        query = query.filter(LearningMaterial.section_id == section_id)
-    if lesson_id:
-        query = query.filter(LearningMaterial.lesson_id == lesson_id)
+    user_cache = get_users_by_ids(mongo_db, [m.uploader_id for m in materials])
+    section_titles = {s.id: s.title for s in list_sections_for_course(mongo_db, course_id)}
+    lesson_titles = {l.id: l.title for l in list_lessons_for_course(mongo_db, course_id)}
 
-    materials = query.order_by(LearningMaterial.created_at.desc()).all()
-    return [build_material_response(m) for m in materials]
+    return [
+        build_material_response(
+            mongo_db,
+            m,
+            user_cache=user_cache,
+            section_titles=section_titles,
+            lesson_titles=lesson_titles,
+        )
+        for m in materials
+    ]
 
 
-def get_material_detail(db: Session, material_id: int, current_user: User) -> MaterialResponse:
+def get_material_detail(
+    mongo_db: Database,
+    material_id: int,
+    current_user: MongoUser,
+) -> MaterialResponse:
     """Retrieve metadata for a specific learning material."""
-    mat = db.query(LearningMaterial).filter(LearningMaterial.id == material_id).first()
+    mat = get_material_by_id(mongo_db, material_id)
     if not mat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning material not found.")
 
-    check_course_material_access(db, mat.course_id, current_user)
-    return build_material_response(mat)
+    check_course_material_access(mongo_db, mat.course_id, current_user)
+    return build_material_response(mongo_db, mat)
 
 
 def update_material(
-    db: Session,
+    mongo_db: Database,
     material_id: int,
     update_data: MaterialUpdate,
-    current_user: User,
+    current_user: MongoUser,
+    sqlite_db: Optional[Session] = None,
 ) -> MaterialResponse:
     """Update title, description, or module linkages for an authorized material."""
-    mat = db.query(LearningMaterial).filter(LearningMaterial.id == material_id).first()
+    mat = get_material_by_id(mongo_db, material_id)
     if not mat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning material not found.")
 
-    course = db.query(Course).filter(Course.id == mat.course_id).first()
+    course = get_course_by_id(mongo_db, mat.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
+    updates: dict = {}
     if update_data.title is not None:
-        mat.title = update_data.title.strip()
+        updates["title"] = update_data.title.strip()
     if update_data.description is not None:
-        mat.description = update_data.description.strip() if update_data.description else None
+        updates["description"] = update_data.description.strip() if update_data.description else None
     if update_data.section_id is not None:
         if update_data.section_id != 0:
-            sec = db.query(CourseSection).filter(
-                CourseSection.id == update_data.section_id,
-                CourseSection.course_id == mat.course_id,
-            ).first()
-            if not sec:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected section does not belong to this course.")
-            mat.section_id = update_data.section_id
+            sec = get_section_by_id(mongo_db, update_data.section_id)
+            if not sec or sec.course_id != mat.course_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected section does not belong to this course.",
+                )
+            updates["section_id"] = update_data.section_id
         else:
-            mat.section_id = None
+            updates["section_id"] = None
     if update_data.lesson_id is not None:
         if update_data.lesson_id != 0:
-            les = db.query(Lesson).filter(
-                Lesson.id == update_data.lesson_id,
-                Lesson.course_id == mat.course_id,
-            ).first()
-            if not les:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected lesson does not belong to this course.")
-            mat.lesson_id = update_data.lesson_id
+            les = get_lesson_by_id(mongo_db, update_data.lesson_id)
+            if not les or les.course_id != mat.course_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected lesson does not belong to this course.",
+                )
+            updates["lesson_id"] = update_data.lesson_id
         else:
-            mat.lesson_id = None
+            updates["lesson_id"] = None
 
-    mat.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(mat)
-    return build_material_response(mat)
+    updated = update_material_doc(mongo_db, mat.id, updates) if updates else mat
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning material not found.")
+    try:
+        sync_material_to_sqlite_shadow(sqlite_db, updated)
+    except Exception:
+        restore_material_snapshot(mongo_db, mat)
+        raise
+
+    return build_material_response(mongo_db, updated)
 
 
-def delete_material(db: Session, material_id: int, current_user: User) -> dict:
-    """Delete learning material from both database and storage provider."""
-    mat = db.query(LearningMaterial).filter(LearningMaterial.id == material_id).first()
+def delete_material(
+    mongo_db: Database,
+    material_id: int,
+    current_user: MongoUser,
+    sqlite_db: Optional[Session] = None,
+) -> dict:
+    """Delete learning material from MongoDB, SQLite shadow, and storage provider."""
+    mat = get_material_by_id(mongo_db, material_id)
     if not mat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning material not found.")
 
-    course = db.query(Course).filter(Course.id == mat.course_id).first()
+    course = get_course_by_id(mongo_db, mat.course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
     check_course_ownership(course, current_user)
 
     storage_key = mat.storage_key
-    db.delete(mat)
-    db.commit()
+    delete_material_doc(mongo_db, material_id)
+    delete_material_from_sqlite_shadow(sqlite_db, material_id)
 
-    # Safely delete from storage
     storage = get_storage_provider()
     storage.delete_file(storage_key)
 
     return {"message": "Learning material deleted successfully."}
 
 
-def get_material_file_for_download(db: Session, material_id: int, current_user: User):
+def get_material_file_for_download(
+    mongo_db: Database,
+    material_id: int,
+    current_user: MongoUser,
+):
     """
     Authenticate and authorize download of material file.
     Returns (material, file_path_or_bytes).
     """
-    mat = db.query(LearningMaterial).filter(LearningMaterial.id == material_id).first()
+    mat = get_material_by_id(mongo_db, material_id)
     if not mat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning material not found.")
 
-    check_course_material_access(db, mat.course_id, current_user)
+    check_course_material_access(mongo_db, mat.course_id, current_user)
 
     storage = get_storage_provider()
     if not storage.file_exists(mat.storage_key):
@@ -271,5 +344,4 @@ def get_material_file_for_download(db: Session, material_id: int, current_user: 
     if local_path:
         return mat, local_path
 
-    # If stream or bytes (e.g. cloud)
     return mat, storage.get_file_bytes(mat.storage_key)

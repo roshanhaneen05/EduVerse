@@ -1,25 +1,70 @@
 import math
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from pydantic import ValidationError
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
+from sqlalchemy.orm import Session
 
-from app.models.ai_learning import (
-    StudyDeadline,
-    StudyNotification,
-    StudyPlan,
-    StudyPreference,
-    StudyTask,
+from app.repositories.ai_repository import (
+    MongoStudyNotification,
+    MongoStudyPlan,
+    MongoStudyPreference,
+    MongoStudyTask,
+    create_study_deadline_doc,
+    create_study_plan_doc,
+    create_study_task_doc,
+    deactivate_active_study_plans,
+    delete_study_task_doc,
+    delete_study_task_from_sqlite_shadow,
+    ensure_study_notification_doc,
+    find_study_notification_by_task_and_type,
+    get_active_study_plan,
+    get_study_notification_by_id,
+    get_study_plan_by_id,
+    get_study_preference,
+    get_study_task_by_id,
+    list_active_study_plans,
+    list_prior_study_tasks,
+    list_study_deadline_ids_for_plans,
+    list_study_deadlines_for_plan,
+    list_study_task_ids_for_plans,
+    list_study_tasks_for_plan,
+    list_unread_study_notifications,
+    mark_study_notifications_read,
+    sync_study_notification_to_sqlite_shadow,
+    sync_study_plan_bundle_to_sqlite_shadow,
+    sync_study_preference_to_sqlite_shadow,
+    sync_study_task_to_sqlite_shadow,
+    update_study_notification_doc,
+    update_study_task_doc,
+    upsert_study_preference_doc,
 )
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.quiz import Quiz, QuizAttempt
+from app.repositories.assignment_repository import (
+    list_assignments_by_course_ids,
+    list_submissions_for_student_assignments,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    MongoCourseSection,
+    MongoLesson,
+    get_course_by_id,
+    get_courses_by_ids,
+    get_lesson_by_id,
+    get_section_by_id,
+    list_enrollments,
+    list_lesson_progress,
+    list_lessons_by_course_ids,
+    list_sections_by_course_ids,
+)
+from app.repositories.quiz_repository import (
+    list_quiz_attempts,
+    list_quizzes_by_course_ids,
+)
 from app.schemas.ai_learning import (
     GeneratedStudyPlanPayload,
     StudyPlanGenerationRequest,
@@ -43,6 +88,27 @@ _TIME_WINDOWS = {
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class EnrichedStudyTask:
+    id: int
+    plan_id: int
+    student_id: int
+    course_id: int
+    section_id: Optional[int]
+    lesson_id: int
+    starts_at: datetime
+    duration_minutes: int
+    priority: str
+    status: str
+    rationale: str
+    completed_at: Optional[datetime]
+    created_at: datetime
+    plan: MongoStudyPlan
+    course: MongoCourse
+    section: Optional[MongoCourseSection]
+    lesson: MongoLesson
+
+
 def _utc(value: Optional[datetime]) -> Optional[datetime]:
     if value is None:
         return None
@@ -51,7 +117,7 @@ def _utc(value: Optional[datetime]) -> Optional[datetime]:
     return value.astimezone(timezone.utc)
 
 
-def _preference_response(preference: Optional[StudyPreference]):
+def _preference_response(preference: Optional[MongoStudyPreference]):
     if preference is None:
         return None
     return StudyPreferenceResponse(
@@ -66,129 +132,113 @@ def _preference_response(preference: Optional[StudyPreference]):
 
 
 def _save_preferences(
-    db: Session,
+    mongo_db: Database,
     student_id: int,
     request: StudyPlanGenerationRequest,
-) -> StudyPreference:
-    preference = (
-        db.query(StudyPreference)
-        .filter(StudyPreference.student_id == student_id)
-        .first()
+) -> MongoStudyPreference:
+    return upsert_study_preference_doc(
+        mongo_db,
+        student_id=student_id,
+        selected_course_ids=request.course_ids,
+        deadlines_json=[
+            {
+                "course_id": item.course_id,
+                "title": item.title,
+                "deadline_type": item.deadline_type,
+                "due_at": item.due_at.isoformat(),
+            }
+            for item in request.deadlines
+        ],
+        available_hours_per_day=request.available_hours_per_day,
+        preferred_time=request.preferred_time,
+        time_zone=request.time_zone,
+        daily_duration_minutes=request.daily_duration_minutes,
+        target_completion_date=request.target_completion_date,
     )
-    if preference is None:
-        preference = StudyPreference(student_id=student_id)
-        db.add(preference)
-    preference.selected_course_ids = request.course_ids
-    preference.deadlines_json = [
-        {
-            "course_id": item.course_id,
-            "title": item.title,
-            "deadline_type": item.deadline_type,
-            "due_at": item.due_at.isoformat(),
-        }
-        for item in request.deadlines
-    ]
-    preference.available_hours_per_day = request.available_hours_per_day
-    preference.preferred_time = request.preferred_time
-    preference.time_zone = request.time_zone
-    preference.daily_duration_minutes = request.daily_duration_minutes
-    preference.target_completion_date = request.target_completion_date
-    preference.updated_at = datetime.now(timezone.utc)
-    return preference
 
 
 def save_study_preferences(
-    db: Session,
+    mongo_db: Database,
     student_id: int,
     request: StudyPlanGenerationRequest,
+    sqlite_db: Optional[Session] = None,
 ) -> StudyPreferenceResponse:
-    _validate_selected_courses(db, student_id, request.course_ids)
-    preference = _save_preferences(db, student_id, request)
-    db.commit()
-    db.refresh(preference)
+    _validate_selected_courses(mongo_db, student_id, request.course_ids)
+    preference = _save_preferences(mongo_db, student_id, request)
+    sync_study_preference_to_sqlite_shadow(sqlite_db, preference)
     return _preference_response(preference)
 
 
-def _validate_selected_courses(db: Session, student_id: int, course_ids: list[int]) -> list[Course]:
-    enrollments = (
-        db.query(CourseEnrollment.course_id)
-        .filter(
-            CourseEnrollment.student_id == student_id,
-            CourseEnrollment.status == "approved",
-            CourseEnrollment.course_id.in_(course_ids),
-        )
-        .all()
+def _validate_selected_courses(
+    mongo_db: Database, student_id: int, course_ids: list[int]
+) -> list[MongoCourse]:
+    enrollments = list_enrollments(
+        mongo_db,
+        course_ids=course_ids,
+        student_id=student_id,
+        status_filter="approved",
     )
-    enrolled_ids = {row[0] for row in enrollments}
+    enrolled_ids = {enr.course_id for enr in enrollments}
     if enrolled_ids != set(course_ids):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Every selected course must have an approved enrollment.",
         )
-    return db.query(Course).filter(Course.id.in_(course_ids)).all()
+    courses_map = get_courses_by_ids(mongo_db, course_ids)
+    return [courses_map[cid] for cid in course_ids if cid in courses_map]
 
 
-def _collect_progress(db: Session, student_id: int, courses: list[Course]) -> tuple[list[dict], list[dict]]:
+def _collect_progress(
+    mongo_db: Database, student_id: int, courses: list[MongoCourse]
+) -> tuple[list[dict], list[dict]]:
     course_ids = [course.id for course in courses]
-    lessons = (
-        db.query(Lesson)
-        .options(joinedload(Lesson.section))
-        .filter(Lesson.course_id.in_(course_ids))
-        .order_by(Lesson.course_id.asc(), Lesson.order_index.asc(), Lesson.id.asc())
-        .all()
-    )
+    courses_map = {c.id: c for c in courses}
+    sections_all = list_sections_by_course_ids(mongo_db, course_ids)
+    sections_map = {s.id: s for s in sections_all}
+    lessons = list_lessons_by_course_ids(mongo_db, course_ids)
     lesson_ids = [lesson.id for lesson in lessons]
     completed_ids = {
-        row[0]
-        for row in db.query(LessonProgress.lesson_id)
-        .filter(
-            LessonProgress.student_id == student_id,
-            LessonProgress.lesson_id.in_(lesson_ids) if lesson_ids else False,
-            LessonProgress.is_completed.is_(True),
+        lp.lesson_id
+        for lp in list_lesson_progress(
+            mongo_db,
+            student_id=student_id,
+            lesson_ids=lesson_ids,
+            completed_only=True,
         )
-        .all()
     }
 
-    lesson_by_course: dict[int, list[Lesson]] = {}
+    lesson_by_course: dict[int, list[MongoLesson]] = {}
     for lesson in lessons:
         lesson_by_course.setdefault(lesson.course_id, []).append(lesson)
 
-    quiz_attempts = (
-        db.query(QuizAttempt, Quiz.course_id)
-        .join(Quiz, Quiz.id == QuizAttempt.quiz_id)
-        .filter(
-            QuizAttempt.student_id == student_id,
-            QuizAttempt.is_completed.is_(True),
-            Quiz.course_id.in_(course_ids),
-        )
-        .all()
+    quizzes = list_quizzes_by_course_ids(mongo_db, course_ids)
+    quiz_to_course = {q.id: q.course_id for q in quizzes}
+    quiz_attempts = list_quiz_attempts(
+        mongo_db,
+        quiz_ids=list(quiz_to_course.keys()),
+        student_id=student_id,
+        completed_only=True,
     )
     quiz_scores: dict[int, list[float]] = {}
-    for attempt, course_id in quiz_attempts:
-        if attempt.total_points:
-            quiz_scores.setdefault(course_id, []).append(attempt.score)
+    for attempt in quiz_attempts:
+        if attempt.quiz_id is not None and attempt.total_points:
+            cid = quiz_to_course.get(attempt.quiz_id)
+            if cid is not None:
+                quiz_scores.setdefault(cid, []).append(attempt.score)
 
-    assignment_rows = (
-        db.query(Assignment, Course.title)
-        .join(Course, Course.id == Assignment.course_id)
-        .filter(
-            Assignment.course_id.in_(course_ids),
-            Assignment.is_published.is_(True),
-            Assignment.due_date.is_not(None),
-        )
-        .all()
+    assignments_all = list_assignments_by_course_ids(
+        mongo_db, course_ids, published_only=True
     )
-    submitted_assignment_ids = {
-        row[0]
-        for row in db.query(AssignmentSubmission.assignment_id)
-        .filter(
-            AssignmentSubmission.student_id == student_id,
-            AssignmentSubmission.assignment_id.in_([item.id for item, _ in assignment_rows])
-            if assignment_rows
-            else False,
-        )
-        .all()
-    }
+    assignment_rows = [
+        (a, courses_map[a.course_id].title)
+        for a in assignments_all
+        if a.due_date is not None and a.course_id in courses_map
+    ]
+    submitted_assignment_ids = set(
+        list_submissions_for_student_assignments(
+            mongo_db, student_id, [item.id for item, _ in assignment_rows]
+        ).keys()
+    )
     now = datetime.now(timezone.utc)
     assignments_by_course: dict[int, list[dict]] = {}
     for assignment, course_title in assignment_rows:
@@ -214,7 +264,9 @@ def _collect_progress(db: Session, student_id: int, courses: list[Course]) -> tu
                 "total_lessons": len(course_lessons),
                 "completed_lessons": completed_count,
                 "completion_percentage": (
-                    round(completed_count / len(course_lessons) * 100, 1) if course_lessons else 0
+                    round(completed_count / len(course_lessons) * 100, 1)
+                    if course_lessons
+                    else 0
                 ),
                 "average_quiz_score": (
                     round(sum(quiz_scores[course.id]) / len(quiz_scores[course.id]), 1)
@@ -226,13 +278,14 @@ def _collect_progress(db: Session, student_id: int, courses: list[Course]) -> tu
         )
         for lesson in course_lessons:
             if lesson.id not in completed_ids:
+                sec = sections_map.get(lesson.section_id) if lesson.section_id else None
                 pending_lessons.append(
                     {
                         "id": lesson.id,
                         "course_id": course.id,
                         "course_title": course.title,
                         "section_id": lesson.section_id,
-                        "section_title": lesson.section.title if lesson.section else None,
+                        "section_title": sec.title if sec else None,
                         "title": lesson.title,
                     }
                 )
@@ -321,7 +374,7 @@ def _rule_based_plan(
     request: StudyPlanGenerationRequest,
     course_progress: list[dict],
     pending_lessons: list[dict],
-    prior_tasks: list[StudyTask],
+    prior_tasks: list[MongoStudyTask],
 ) -> GeneratedStudyPlanPayload:
     progress_by_id = {course["course_id"]: course for course in course_progress}
     lesson_attempts: dict[int, list[str]] = {}
@@ -445,7 +498,7 @@ def _rule_based_plan(
 
 
 def _add_study_notification(
-    db: Session,
+    mongo_db: Database,
     *,
     student_id: int,
     key: str,
@@ -454,42 +507,30 @@ def _add_study_notification(
     remind_at: datetime,
     task_id: Optional[int] = None,
     deadline_id: Optional[int] = None,
-) -> None:
-    existing = (
-        db.query(StudyNotification.id)
-        .filter(StudyNotification.notification_key == key)
-        .first()
+) -> Optional[MongoStudyNotification]:
+    return ensure_study_notification_doc(
+        mongo_db,
+        student_id=student_id,
+        key=key,
+        notification_type=notification_type,
+        message=message,
+        remind_at=remind_at,
+        task_id=task_id,
+        deadline_id=deadline_id,
     )
-    if existing is None:
-        db.add(
-            StudyNotification(
-                student_id=student_id,
-                task_id=task_id,
-                deadline_id=deadline_id,
-                notification_key=key,
-                notification_type=notification_type,
-                message=message,
-                remind_at=remind_at,
-            )
-        )
 
 
 def generate_study_plan(
-    db: Session,
+    mongo_db: Database,
     student_id: int,
     request: StudyPlanGenerationRequest,
-) -> StudyPlan:
-    courses = _validate_selected_courses(db, student_id, request.course_ids)
-    course_progress, pending_lessons = _collect_progress(db, student_id, courses)
+    sqlite_db: Optional[Session] = None,
+) -> MongoStudyPlan:
+    courses = _validate_selected_courses(mongo_db, student_id, request.course_ids)
+    course_progress, pending_lessons = _collect_progress(mongo_db, student_id, courses)
     lessons_by_id = {lesson["id"]: lesson for lesson in pending_lessons}
 
-    prior_tasks = (
-        db.query(StudyTask)
-        .filter(StudyTask.student_id == student_id, StudyTask.course_id.in_(request.course_ids))
-        .order_by(StudyTask.created_at.desc())
-        .limit(100)
-        .all()
-    )
+    prior_tasks = list_prior_study_tasks(mongo_db, student_id, request.course_ids, limit=100)
     prompt = (
         "Create a personalized study timetable from the supplied real EduVerse progress data. "
         "Return a JSON object with tasks and recommendations. Include every pending lesson exactly once, "
@@ -541,7 +582,7 @@ def generate_study_plan(
         generation_mode = "rules"
         generated = _rule_based_plan(request, course_progress, pending_lessons, prior_tasks)
         scheduled = _make_schedule(request, generated, lessons_by_id)
-    except ValidationError as exc:
+    except ValidationError:
         logger.warning("Using rule-based study plan after invalid AI output.")
         generation_mode = "rules"
         generated = _rule_based_plan(request, course_progress, pending_lessons, prior_tasks)
@@ -553,8 +594,28 @@ def generate_study_plan(
         generation_mode = "rules"
         generated = _rule_based_plan(request, course_progress, pending_lessons, prior_tasks)
         scheduled = _make_schedule(request, generated, lessons_by_id)
+
     now = datetime.now(timezone.utc)
-    plan = StudyPlan(
+    preference = _save_preferences(mongo_db, student_id, request)
+
+    old_active_plans = list_active_study_plans(mongo_db, student_id)
+    old_plan_ids = [p.id for p in old_active_plans]
+    old_task_ids = list_study_task_ids_for_plans(mongo_db, old_plan_ids)
+    old_deadline_ids = list_study_deadline_ids_for_plans(mongo_db, old_plan_ids)
+    if old_task_ids:
+        mark_study_notifications_read(
+            mongo_db,
+            {"student_id": student_id, "task_id": {"$in": old_task_ids}, "is_read": False},
+        )
+    if old_deadline_ids:
+        mark_study_notifications_read(
+            mongo_db,
+            {"student_id": student_id, "deadline_id": {"$in": old_deadline_ids}, "is_read": False},
+        )
+    deactivate_active_study_plans(mongo_db, student_id)
+
+    plan = create_study_plan_doc(
+        mongo_db,
         student_id=student_id,
         selected_course_ids=request.course_ids,
         target_completion_date=request.target_completion_date,
@@ -564,82 +625,36 @@ def generate_study_plan(
         daily_duration_minutes=request.daily_duration_minutes,
         recommendations_json=generated.recommendations,
         generation_mode=generation_mode,
-        is_active=True,
         generated_at=now,
     )
-    _save_preferences(db, student_id, request)
-    old_active_plans = (
-        db.query(StudyPlan)
-        .filter(StudyPlan.student_id == student_id, StudyPlan.is_active.is_(True))
-        .all()
-    )
-    old_task_ids = [
-        task_id
-        for (task_id,) in db.query(StudyTask.id)
-        .filter(StudyTask.plan_id.in_([item.id for item in old_active_plans]))
-        .all()
-    ] if old_active_plans else []
-    old_deadline_ids = [
-        deadline_id
-        for (deadline_id,) in db.query(StudyDeadline.id)
-        .filter(StudyDeadline.plan_id.in_([item.id for item in old_active_plans]))
-        .all()
-    ] if old_active_plans else []
-    if old_task_ids:
-        db.query(StudyNotification).filter(
-            StudyNotification.student_id == student_id,
-            StudyNotification.task_id.in_(old_task_ids),
-            StudyNotification.is_read.is_(False),
-        ).update({StudyNotification.is_read: True}, synchronize_session=False)
-    if old_deadline_ids:
-        db.query(StudyNotification).filter(
-            StudyNotification.student_id == student_id,
-            StudyNotification.deadline_id.in_(old_deadline_ids),
-            StudyNotification.is_read.is_(False),
-        ).update({StudyNotification.is_read: True}, synchronize_session=False)
-    db.query(StudyPlan).filter(
-        StudyPlan.student_id == student_id,
-        StudyPlan.is_active.is_(True),
-    ).update({StudyPlan.is_active: False}, synchronize_session=False)
-    db.add(plan)
-    db.flush()
 
+    plan_deadlines = []
     for deadline in request.deadlines:
         due_at = _utc(deadline.due_at)
         if due_at is None:
             continue
-        db_deadline = StudyDeadline(
-            plan_id=plan.id,
-            student_id=student_id,
-            course_id=deadline.course_id,
-            title=deadline.title,
-            deadline_type=deadline.deadline_type,
-            due_at=due_at,
+        plan_deadlines.append(
+            create_study_deadline_doc(
+                mongo_db,
+                plan_id=plan.id,
+                student_id=student_id,
+                course_id=deadline.course_id,
+                title=deadline.title,
+                deadline_type=deadline.deadline_type,
+                due_at=due_at,
+            )
         )
-        db.add(db_deadline)
 
-    future_assignment_rows = (
-        db.query(Assignment, Course.title)
-        .join(Course, Course.id == Assignment.course_id)
-        .filter(
-            Assignment.course_id.in_(request.course_ids),
-            Assignment.is_published.is_(True),
-            Assignment.due_date.is_not(None),
-        )
-        .all()
+    assignments_all = list_assignments_by_course_ids(
+        mongo_db, request.course_ids, published_only=True
     )
-    submitted_assignment_ids = {
-        row[0]
-        for row in db.query(AssignmentSubmission.assignment_id)
-        .filter(
-            AssignmentSubmission.student_id == student_id,
-            AssignmentSubmission.assignment_id.in_([item.id for item, _ in future_assignment_rows])
-            if future_assignment_rows
-            else False,
-        )
-        .all()
-    }
-    for assignment, _course_title in future_assignment_rows:
+    future_assignments = [a for a in assignments_all if a.due_date is not None]
+    submitted_assignment_ids = set(
+        list_submissions_for_student_assignments(
+            mongo_db, student_id, [a.id for a in future_assignments]
+        ).keys()
+    )
+    for assignment in future_assignments:
         due_at = _utc(assignment.due_date)
         already_added = any(
             item.course_id == assignment.course_id and item.title.casefold() == assignment.title.casefold()
@@ -651,8 +666,9 @@ def generate_study_plan(
             and due_at > now
             and not already_added
         ):
-            db.add(
-                StudyDeadline(
+            plan_deadlines.append(
+                create_study_deadline_doc(
+                    mongo_db,
                     plan_id=plan.id,
                     student_id=student_id,
                     course_id=assignment.course_id,
@@ -662,8 +678,11 @@ def generate_study_plan(
                 )
             )
 
+    created_tasks = []
+    created_notifications = []
     for task_data in scheduled:
-        task = StudyTask(
+        task = create_study_task_doc(
+            mongo_db,
             plan_id=plan.id,
             student_id=student_id,
             course_id=task_data["course_id"],
@@ -672,13 +691,11 @@ def generate_study_plan(
             starts_at=task_data["starts_at"],
             duration_minutes=task_data["duration_minutes"],
             priority=task_data["priority"],
-            status="pending",
             rationale=task_data["rationale"],
         )
-        db.add(task)
-        db.flush()
-        _add_study_notification(
-            db,
+        created_tasks.append(task)
+        notif = _add_study_notification(
+            mongo_db,
             student_id=student_id,
             key=f"task-upcoming-{task.id}",
             notification_type="upcoming_session",
@@ -686,16 +703,12 @@ def generate_study_plan(
             remind_at=task.starts_at - timedelta(minutes=30),
             task_id=task.id,
         )
+        if notif is not None:
+            created_notifications.append(notif)
 
-    db.flush()
-    plan_deadlines = (
-        db.query(StudyDeadline)
-        .filter(StudyDeadline.plan_id == plan.id)
-        .all()
-    )
     for deadline in plan_deadlines:
-        _add_study_notification(
-            db,
+        notif = _add_study_notification(
+            mongo_db,
             student_id=student_id,
             key=f"deadline-{deadline.id}",
             notification_type="approaching_deadline",
@@ -703,12 +716,21 @@ def generate_study_plan(
             remind_at=max(now, _utc(deadline.due_at) - timedelta(days=1)),
             deadline_id=deadline.id,
         )
-    db.commit()
-    db.refresh(plan)
+        if notif is not None:
+            created_notifications.append(notif)
+
+    sync_study_preference_to_sqlite_shadow(sqlite_db, preference)
+    sync_study_plan_bundle_to_sqlite_shadow(
+        sqlite_db,
+        plan,
+        plan_deadlines,
+        created_tasks,
+        created_notifications,
+    )
     return plan
 
 
-def serialize_study_task(task: StudyTask) -> dict:
+def serialize_study_task(task: EnrichedStudyTask) -> dict:
     local_start = _utc(task.starts_at).astimezone(ZoneInfo(task.plan.time_zone))
     ends_at = local_start + timedelta(minutes=task.duration_minutes)
     return {
@@ -730,49 +752,108 @@ def serialize_study_task(task: StudyTask) -> dict:
     }
 
 
-def _refresh_missed_tasks(db: Session, student_id: int, plan: StudyPlan) -> None:
-    now = datetime.now(timezone.utc)
-    tasks = (
-        db.query(StudyTask)
-        .filter(
-            StudyTask.plan_id == plan.id,
-            StudyTask.student_id == student_id,
-            StudyTask.status == "pending",
+def _enrich_study_tasks(
+    mongo_db: Database,
+    plan: MongoStudyPlan,
+    tasks: List[MongoStudyTask],
+) -> List[EnrichedStudyTask]:
+    if not tasks:
+        return []
+    course_ids = list({t.course_id for t in tasks})
+    courses_map = get_courses_by_ids(mongo_db, course_ids)
+    sections_map = {s.id: s for s in list_sections_by_course_ids(mongo_db, course_ids)}
+    lessons_map = {l.id: l for l in list_lessons_by_course_ids(mongo_db, course_ids)}
+    enriched: List[EnrichedStudyTask] = []
+    for task in tasks:
+        course = courses_map.get(task.course_id)
+        lesson = lessons_map.get(task.lesson_id)
+        if course is None or lesson is None:
+            continue
+        section = sections_map.get(task.section_id) if task.section_id is not None else None
+        enriched.append(
+            EnrichedStudyTask(
+                id=task.id,
+                plan_id=task.plan_id,
+                student_id=task.student_id,
+                course_id=task.course_id,
+                section_id=task.section_id,
+                lesson_id=task.lesson_id,
+                starts_at=task.starts_at,
+                duration_minutes=task.duration_minutes,
+                priority=task.priority,
+                status=task.status,
+                rationale=task.rationale,
+                completed_at=task.completed_at,
+                created_at=task.created_at,
+                plan=plan,
+                course=course,
+                section=section,
+                lesson=lesson,
+            )
         )
-        .all()
+    return enriched
+
+
+def _refresh_missed_tasks(
+    mongo_db: Database,
+    student_id: int,
+    plan: MongoStudyPlan,
+    sqlite_db: Optional[Session] = None,
+) -> None:
+    now = datetime.now(timezone.utc)
+    tasks = list_study_tasks_for_plan(
+        mongo_db, plan.id, student_id=student_id, status_filter="pending"
     )
+    if not tasks:
+        return
+    course_ids = list({t.course_id for t in tasks})
+    courses_map = get_courses_by_ids(mongo_db, course_ids)
+    lessons_map = {l.id: l for l in list_lessons_by_course_ids(mongo_db, course_ids)}
     for task in tasks:
         ends_at = _utc(task.starts_at) + timedelta(minutes=task.duration_minutes)
         if ends_at < now:
-            task.status = "missed"
-            _add_study_notification(
-                db,
+            updated_task = update_study_task_doc(mongo_db, task.id, {"status": "missed"})
+            if updated_task is not None:
+                sync_study_task_to_sqlite_shadow(sqlite_db, updated_task)
+            course = courses_map.get(task.course_id)
+            lesson = lessons_map.get(task.lesson_id)
+            notif = _add_study_notification(
+                mongo_db,
                 student_id=student_id,
                 key=f"task-missed-{task.id}",
                 notification_type="missed_task",
-                message=f"Missed study task: {task.lesson.title} in {task.course.title}. Reschedule it when ready.",
+                message=f"Missed study task: {lesson.title if lesson else 'Lesson'} in {course.title if course else 'Course'}. Reschedule it when ready.",
                 remind_at=now,
                 task_id=task.id,
             )
+            if notif is not None:
+                sync_study_notification_to_sqlite_shadow(sqlite_db, notif)
 
 
-def _course_progress(db: Session, student_id: int, course_ids: list[int]) -> list[dict]:
+def _course_progress(mongo_db: Database, student_id: int, course_ids: list[int]) -> list[dict]:
     if not course_ids:
         return []
-    courses = db.query(Course).filter(Course.id.in_(course_ids)).order_by(Course.title.asc()).all()
+    courses_map = get_courses_by_ids(mongo_db, course_ids)
+    courses = sorted(courses_map.values(), key=lambda c: c.title)
+    lessons_all = list_lessons_by_course_ids(mongo_db, course_ids)
+    completed_lesson_ids = {
+        lp.lesson_id
+        for lp in list_lesson_progress(
+            mongo_db,
+            student_id=student_id,
+            lesson_ids=[l.id for l in lessons_all],
+            completed_only=True,
+        )
+    }
+    lessons_by_course: Dict[int, list] = {}
+    for l in lessons_all:
+        lessons_by_course.setdefault(l.course_id, []).append(l)
+
     rows = []
     for course in courses:
-        total = db.query(Lesson.id).filter(Lesson.course_id == course.id).count()
-        completed = (
-            db.query(LessonProgress.id)
-            .join(Lesson, Lesson.id == LessonProgress.lesson_id)
-            .filter(
-                Lesson.course_id == course.id,
-                LessonProgress.student_id == student_id,
-                LessonProgress.is_completed.is_(True),
-            )
-            .count()
-        )
+        c_lessons = lessons_by_course.get(course.id, [])
+        total = len(c_lessons)
+        completed = sum(1 for l in c_lessons if l.id in completed_lesson_ids)
         rows.append(
             {
                 "course_id": course.id,
@@ -785,23 +866,13 @@ def _course_progress(db: Session, student_id: int, course_ids: list[int]) -> lis
     return rows
 
 
-def get_planner_dashboard(db: Session, student_id: int) -> dict:
-    preference = (
-        db.query(StudyPreference)
-        .filter(StudyPreference.student_id == student_id)
-        .first()
-    )
-    plan = (
-        db.query(StudyPlan)
-        .options(
-            joinedload(StudyPlan.tasks).joinedload(StudyTask.course),
-            joinedload(StudyPlan.tasks).joinedload(StudyTask.section),
-            joinedload(StudyPlan.tasks).joinedload(StudyTask.lesson),
-        )
-        .filter(StudyPlan.student_id == student_id, StudyPlan.is_active.is_(True))
-        .order_by(StudyPlan.generated_at.desc())
-        .first()
-    )
+def get_planner_dashboard(
+    mongo_db: Database,
+    student_id: int,
+    sqlite_db: Optional[Session] = None,
+) -> dict:
+    preference = get_study_preference(mongo_db, student_id)
+    plan = get_active_study_plan(mongo_db, student_id)
     if plan is None:
         return {
             "preferences": _preference_response(preference),
@@ -816,41 +887,20 @@ def get_planner_dashboard(db: Session, student_id: int) -> dict:
             "overall_progress": 0.0,
         }
 
-    _refresh_missed_tasks(db, student_id, plan)
-    task_rows = (
-        db.query(StudyTask)
-        .options(
-            joinedload(StudyTask.course),
-            joinedload(StudyTask.section),
-            joinedload(StudyTask.lesson),
-        )
-        .filter(StudyTask.plan_id == plan.id, StudyTask.student_id == student_id)
-        .order_by(StudyTask.starts_at.asc())
-        .all()
+    _refresh_missed_tasks(mongo_db, student_id, plan, sqlite_db=sqlite_db)
+    task_rows = list_study_tasks_for_plan(mongo_db, plan.id, student_id=student_id)
+    enriched_tasks = _enrich_study_tasks(mongo_db, plan, task_rows)
+    reminders = list_unread_study_notifications(
+        mongo_db,
+        student_id,
+        remind_before=datetime.now(timezone.utc) + timedelta(days=7),
+        limit=100,
     )
-    db.flush()
-    reminders = (
-        db.query(StudyNotification)
-        .filter(
-            StudyNotification.student_id == student_id,
-            StudyNotification.is_read.is_(False),
-            StudyNotification.remind_at <= datetime.now(timezone.utc) + timedelta(days=7),
-        )
-        .order_by(StudyNotification.remind_at.asc())
-        .limit(100)
-        .all()
-    )
-    progress = _course_progress(db, student_id, plan.selected_course_ids or [])
-    deadline_rows = (
-        db.query(StudyDeadline)
-        .filter(StudyDeadline.plan_id == plan.id, StudyDeadline.student_id == student_id)
-        .order_by(StudyDeadline.due_at.asc())
-        .all()
-    )
+    progress = _course_progress(mongo_db, student_id, plan.selected_course_ids or [])
+    deadline_rows = list_study_deadlines_for_plan(mongo_db, plan.id, student_id=student_id)
     total_lessons = sum(item["total_lessons"] for item in progress)
     completed_lessons = sum(item["completed_lessons"] for item in progress)
-    tasks = [serialize_study_task(task) for task in task_rows]
-    db.commit()
+    tasks = [serialize_study_task(task) for task in enriched_tasks]
     return {
         "preferences": _preference_response(preference),
         "plan_id": plan.id,
@@ -885,50 +935,71 @@ def get_planner_dashboard(db: Session, student_id: int) -> dict:
     }
 
 
+def _get_owned_task(mongo_db: Database, student_id: int, task_id: int) -> EnrichedStudyTask:
+    task = get_study_task_by_id(mongo_db, task_id)
+    if task is None or task.student_id != student_id:
+        raise HTTPException(status_code=404, detail="Study task not found.")
+    plan = get_study_plan_by_id(mongo_db, task.plan_id)
+    course = get_course_by_id(mongo_db, task.course_id)
+    lesson = get_lesson_by_id(mongo_db, task.lesson_id)
+    if plan is None or course is None or lesson is None:
+        raise HTTPException(status_code=404, detail="Study task not found.")
+    section = get_section_by_id(mongo_db, task.section_id) if task.section_id is not None else None
+    return EnrichedStudyTask(
+        id=task.id,
+        plan_id=task.plan_id,
+        student_id=task.student_id,
+        course_id=task.course_id,
+        section_id=task.section_id,
+        lesson_id=task.lesson_id,
+        starts_at=task.starts_at,
+        duration_minutes=task.duration_minutes,
+        priority=task.priority,
+        status=task.status,
+        rationale=task.rationale,
+        completed_at=task.completed_at,
+        created_at=task.created_at,
+        plan=plan,
+        course=course,
+        section=section,
+        lesson=lesson,
+    )
+
+
 def update_study_task_status(
-    db: Session,
+    mongo_db: Database,
     student_id: int,
     task_id: int,
-) -> StudyTask:
-    task = _get_owned_task(db, student_id, task_id)
+    sqlite_db: Optional[Session] = None,
+) -> EnrichedStudyTask:
+    task = _get_owned_task(mongo_db, student_id, task_id)
     if task.status == "completed":
         raise HTTPException(status_code=409, detail="This study task is already completed.")
-    task.status = "completed"
-    task.completed_at = datetime.now(timezone.utc)
-    db.query(StudyNotification).filter(
-        StudyNotification.task_id == task.id,
-        StudyNotification.student_id == student_id,
-        StudyNotification.is_read.is_(False),
-    ).update({StudyNotification.is_read: True}, synchronize_session=False)
-    db.commit()
-    db.refresh(task)
-    return task
-
-
-def _get_owned_task(db: Session, student_id: int, task_id: int) -> StudyTask:
-    task = (
-        db.query(StudyTask)
-        .options(
-            joinedload(StudyTask.plan),
-            joinedload(StudyTask.course),
-            joinedload(StudyTask.section),
-            joinedload(StudyTask.lesson),
-        )
-        .filter(StudyTask.id == task_id, StudyTask.student_id == student_id)
-        .first()
+    completed_at = datetime.now(timezone.utc)
+    updated_task = update_study_task_doc(
+        mongo_db,
+        task.id,
+        {"status": "completed", "completed_at": completed_at},
     )
-    if task is None:
-        raise HTTPException(status_code=404, detail="Study task not found.")
+    mark_study_notifications_read(
+        mongo_db,
+        {"task_id": task.id, "student_id": student_id, "is_read": False},
+    )
+    if updated_task is not None:
+        sync_study_task_to_sqlite_shadow(sqlite_db, updated_task)
+    task.status = "completed"
+    task.completed_at = completed_at
     return task
 
 
 def reschedule_study_task(
-    db: Session,
+    mongo_db: Database,
     student_id: int,
     task_id: int,
     scheduled_at: datetime,
-) -> StudyTask:
-    task = _get_owned_task(db, student_id, task_id)
+    sqlite_db: Optional[Session] = None,
+) -> EnrichedStudyTask:
+    task = _get_owned_task(mongo_db, student_id, task_id)
     if not task.plan.is_active:
         raise HTTPException(status_code=409, detail="Only tasks in the active plan can be rescheduled.")
     if task.status == "completed":
@@ -947,15 +1018,12 @@ def reschedule_study_task(
     new_end = local_start + timedelta(minutes=task.duration_minutes)
     if new_end.time().replace(tzinfo=None) > end_clock:
         raise HTTPException(status_code=422, detail="The study task must finish within your preferred study time.")
-    other_tasks = (
-        db.query(StudyTask)
-        .filter(
-            StudyTask.plan_id == task.plan_id,
-            StudyTask.student_id == student_id,
-            StudyTask.id != task.id,
-            StudyTask.status == "pending",
-        )
-        .all()
+    other_tasks = list_study_tasks_for_plan(
+        mongo_db,
+        task.plan_id,
+        student_id=student_id,
+        status_filter="pending",
+        exclude_task_id=task.id,
     )
     for other in other_tasks:
         other_start = _utc(other.starts_at)
@@ -971,30 +1039,32 @@ def reschedule_study_task(
     if same_day_minutes + task.duration_minutes > daily_limit:
         raise HTTPException(status_code=409, detail="This would exceed your available study time for that day.")
 
-    task.starts_at = starts_at
-    task.status = "pending"
-    task.completed_at = None
-    db.query(StudyNotification).filter(
-        StudyNotification.task_id == task.id,
-        StudyNotification.student_id == student_id,
-        StudyNotification.notification_type == "missed_task",
-        StudyNotification.is_read.is_(False),
-    ).update({StudyNotification.is_read: True}, synchronize_session=False)
-    upcoming = (
-        db.query(StudyNotification)
-        .filter(
-            StudyNotification.task_id == task.id,
-            StudyNotification.student_id == student_id,
-            StudyNotification.notification_type == "upcoming_session",
-        )
-        .first()
+    updated_task = update_study_task_doc(
+        mongo_db,
+        task.id,
+        {"starts_at": starts_at, "status": "pending", "completed_at": None},
     )
-    if upcoming:
-        upcoming.remind_at = starts_at - timedelta(minutes=30)
-        upcoming.is_read = False
+    mark_study_notifications_read(
+        mongo_db,
+        {
+            "task_id": task.id,
+            "student_id": student_id,
+            "notification_type": "missed_task",
+            "is_read": False,
+        },
+    )
+    upcoming = find_study_notification_by_task_and_type(
+        mongo_db, task.id, student_id, "upcoming_session"
+    )
+    if upcoming is not None:
+        notif = update_study_notification_doc(
+            mongo_db,
+            upcoming.id,
+            {"remind_at": starts_at - timedelta(minutes=30), "is_read": False},
+        )
     else:
-        _add_study_notification(
-            db,
+        notif = _add_study_notification(
+            mongo_db,
             student_id=student_id,
             key=f"task-upcoming-{task.id}",
             notification_type="upcoming_session",
@@ -1002,31 +1072,39 @@ def reschedule_study_task(
             remind_at=starts_at - timedelta(minutes=30),
             task_id=task.id,
         )
-    db.commit()
-    db.refresh(task)
+    if updated_task is not None:
+        sync_study_task_to_sqlite_shadow(sqlite_db, updated_task)
+    if notif is not None:
+        sync_study_notification_to_sqlite_shadow(sqlite_db, notif)
+
+    task.starts_at = starts_at
+    task.status = "pending"
+    task.completed_at = None
     return task
 
 
-def delete_study_task(db: Session, student_id: int, task_id: int) -> None:
-    task = _get_owned_task(db, student_id, task_id)
+def delete_study_task(
+    mongo_db: Database,
+    student_id: int,
+    task_id: int,
+    sqlite_db: Optional[Session] = None,
+) -> None:
+    task = _get_owned_task(mongo_db, student_id, task_id)
     if not task.plan.is_active:
         raise HTTPException(status_code=409, detail="Only tasks in the active plan can be deleted.")
-    db.delete(task)
-    db.commit()
+    delete_study_task_doc(mongo_db, task.id)
+    delete_study_task_from_sqlite_shadow(sqlite_db, task.id)
 
 
-def mark_study_reminder_read(db: Session, student_id: int, reminder_id: int) -> StudyNotification:
-    reminder = (
-        db.query(StudyNotification)
-        .filter(
-            StudyNotification.id == reminder_id,
-            StudyNotification.student_id == student_id,
-        )
-        .first()
-    )
-    if reminder is None:
+def mark_study_reminder_read(
+    mongo_db: Database,
+    student_id: int,
+    reminder_id: int,
+    sqlite_db: Optional[Session] = None,
+) -> MongoStudyNotification:
+    reminder = get_study_notification_by_id(mongo_db, reminder_id)
+    if reminder is None or reminder.student_id != student_id:
         raise HTTPException(status_code=404, detail="Study reminder not found.")
-    reminder.is_read = True
-    db.commit()
-    db.refresh(reminder)
-    return reminder
+    updated = update_study_notification_doc(mongo_db, reminder.id, {"is_read": True}) or reminder
+    sync_study_notification_to_sqlite_shadow(sqlite_db, updated)
+    return updated

@@ -1,71 +1,63 @@
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 from fastapi import HTTPException, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.user import User
+from app.repositories.course_repository import (
+    count_lessons_for_course,
+    get_adjacent_lesson_ids,
+    get_completed_lesson_ids,
+    get_course_by_id,
+    get_enrollment_by_student_and_course,
+    get_lesson_by_id,
+    get_lesson_progress,
+    list_lessons_for_course,
+    restore_enrollment_snapshot,
+    sync_enrollment_to_sqlite_shadow,
+    sync_lesson_progress_to_sqlite_shadow,
+    update_enrollment_completion,
+    upsert_lesson_progress,
+)
+from app.repositories.user_repository import MongoUser
 from app.schemas.lesson import LessonProgressResponse, LessonResponse
 
 
-def get_lesson_nav(db: Session, course_id: int, current_order_index: int) -> Tuple[Optional[int], Optional[int]]:
+def get_lesson_nav(
+    mongo_db: Database,
+    course_id: int,
+    current_order_index: int,
+) -> Tuple[Optional[int], Optional[int]]:
     """Find prev and next lesson IDs based on order_index."""
-    prev_lesson = (
-        db.query(Lesson.id)
-        .filter(Lesson.course_id == course_id, Lesson.order_index < current_order_index)
-        .order_by(Lesson.order_index.desc())
-        .first()
-    )
-    next_lesson = (
-        db.query(Lesson.id)
-        .filter(Lesson.course_id == course_id, Lesson.order_index > current_order_index)
-        .order_by(Lesson.order_index.asc())
-        .first()
-    )
-    prev_id = prev_lesson[0] if prev_lesson else None
-    next_id = next_lesson[0] if next_lesson else None
-    return prev_id, next_id
+    return get_adjacent_lesson_ids(mongo_db, course_id, current_order_index)
 
 
-def get_lesson_for_user(db: Session, lesson_id: int, user: User) -> LessonResponse:
-    """Fetch lesson content and verify enrollment or authorization."""
-    lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+def get_lesson_for_user(
+    mongo_db: Database,
+    lesson_id: int,
+    user: MongoUser,
+) -> LessonResponse:
+    """Fetch lesson content from MongoDB and verify enrollment or authorization."""
+    lesson = get_lesson_by_id(mongo_db, lesson_id)
     if not lesson:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Lesson not found.",
         )
 
-    course = db.query(Course).filter(Course.id == lesson.course_id).first()
+    course = get_course_by_id(mongo_db, lesson.course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Associated course not found.")
 
     if user.role != "admin" and course.instructor_id != user.id:
-        enrollment = (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.student_id == user.id,
-                CourseEnrollment.course_id == lesson.course_id,
-                CourseEnrollment.status == "approved",
-            )
-            .first()
-        )
-        if not enrollment:
+        enrollment = get_enrollment_by_student_and_course(mongo_db, user.id, lesson.course_id)
+        if not enrollment or enrollment.status != "approved":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You must be enrolled in this course to view its lessons.",
             )
 
-    progress = (
-        db.query(LessonProgress)
-        .filter(
-            LessonProgress.student_id == user.id,
-            LessonProgress.lesson_id == lesson.id,
-        )
-        .first()
-    )
+    progress = get_lesson_progress(mongo_db, user.id, lesson.id)
     is_completed = progress.is_completed if progress else False
 
     return LessonResponse(
@@ -82,20 +74,18 @@ def get_lesson_for_user(db: Session, lesson_id: int, user: User) -> LessonRespon
     )
 
 
-def mark_lesson_complete(db: Session, lesson_id: int, user: User) -> LessonProgressResponse:
-    """Mark a lesson complete and update overall course completion percentage."""
-    lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+def mark_lesson_complete(
+    mongo_db: Database,
+    lesson_id: int,
+    user: MongoUser,
+    sqlite_db: Optional[Session] = None,
+) -> LessonProgressResponse:
+    """Mark a lesson complete in MongoDB and update overall course completion percentage."""
+    lesson = get_lesson_by_id(mongo_db, lesson_id)
     if not lesson:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found.")
 
-    enrollment = (
-        db.query(CourseEnrollment)
-        .filter(
-            CourseEnrollment.student_id == user.id,
-            CourseEnrollment.course_id == lesson.course_id,
-        )
-        .first()
-    )
+    enrollment = get_enrollment_by_student_and_course(mongo_db, user.id, lesson.course_id)
     if (
         user.role not in ("instructor", "admin")
         and (not enrollment or enrollment.status != "approved")
@@ -106,55 +96,42 @@ def mark_lesson_complete(db: Session, lesson_id: int, user: User) -> LessonProgr
         )
 
     now = datetime.now(timezone.utc)
-    progress = (
-        db.query(LessonProgress)
-        .filter(
-            LessonProgress.student_id == user.id,
-            LessonProgress.lesson_id == lesson_id,
-        )
-        .first()
+    progress = upsert_lesson_progress(
+        mongo_db,
+        student_id=user.id,
+        lesson_id=lesson_id,
+        is_completed=True,
+        now=now,
     )
-    if not progress:
-        progress = LessonProgress(
-            student_id=user.id,
-            lesson_id=lesson_id,
-            is_completed=True,
-            completed_at=now,
-            updated_at=now,
-        )
-        db.add(progress)
-    else:
-        progress.is_completed = True
-        progress.completed_at = now
-        progress.updated_at = now
+    sync_lesson_progress_to_sqlite_shadow(sqlite_db, progress)
 
-    db.commit()
-
-    total_lessons = db.query(Lesson).filter(Lesson.course_id == lesson.course_id).count()
-    completed_lessons = (
-        db.query(LessonProgress)
-        .join(Lesson, Lesson.id == LessonProgress.lesson_id)
-        .filter(
-            LessonProgress.student_id == user.id,
-            Lesson.course_id == lesson.course_id,
-            LessonProgress.is_completed == True,
-        )
-        .count()
+    course_lessons = list_lessons_for_course(mongo_db, lesson.course_id)
+    total_lessons = len(course_lessons) if course_lessons else count_lessons_for_course(mongo_db, lesson.course_id)
+    completed_ids = get_completed_lesson_ids(
+        mongo_db,
+        user.id,
+        [l.id for l in course_lessons],
     )
+    completed_lessons = len(completed_ids)
 
     completion_percentage = (
         round((completed_lessons / total_lessons) * 100.0, 1) if total_lessons > 0 else 100.0
     )
 
     if enrollment:
-        enrollment.completion_percentage = completion_percentage
-        db.commit()
+        updated_enr = update_enrollment_completion(mongo_db, enrollment.id, completion_percentage)
+        if updated_enr:
+            try:
+                sync_enrollment_to_sqlite_shadow(sqlite_db, updated_enr)
+            except Exception:
+                restore_enrollment_snapshot(mongo_db, enrollment)
+                raise
 
     return LessonProgressResponse(
         student_id=user.id,
         lesson_id=lesson_id,
         is_completed=True,
-        completed_at=now,
-        updated_at=now,
+        completed_at=progress.completed_at or now,
+        updated_at=progress.updated_at or now,
         course_completion_percentage=completion_percentage,
     )

@@ -1,13 +1,22 @@
+import hashlib
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import update
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.dependencies import get_current_user, get_db
-from datetime import datetime, timezone
-import hashlib
-from app.models.instructor import InstructorPasswordToken, InstructorProfile
-from app.models.user import User, UserRole
+from app.dependencies import get_current_user, get_db, get_mongo_db
+from app.models.user import UserRole
+from app.repositories.user_repository import (
+    MongoUser,
+    claim_password_token,
+    find_unused_password_token,
+    get_instructor_profile_by_user_id,
+    get_user_by_id,
+    sync_or_rollback_user_shadow,
+    update_user_fields,
+)
 from app.schemas.auth import TokenResponse
 from app.schemas.common import MessageResponse
 from app.schemas.user import (
@@ -37,8 +46,12 @@ settings = get_settings()
     status_code=status.HTTP_201_CREATED,
     summary="Register a new student account",
 )
-def register(user_in: UserCreate, db: Session = Depends(get_db)):
-    user = register_user(db, user_in)
+def register(
+    user_in: UserCreate,
+    mongo_db: Database = Depends(get_mongo_db),
+    db: Session = Depends(get_db),
+):
+    user = register_user(mongo_db, user_in, sqlite_db=db)
     return user
 
 
@@ -48,9 +61,14 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
     status_code=status.HTTP_200_OK,
     summary="Authenticate and receive JWT access token",
 )
-def login(login_data: UserLogin, request: Request, response: Response, db: Session = Depends(get_db)):
+def login(
+    login_data: UserLogin,
+    request: Request,
+    response: Response,
+    mongo_db: Database = Depends(get_mongo_db),
+):
     check_rate_limit(request, limit=15, window_seconds=60, key_prefix="login")
-    user = authenticate_user(db, login_data.email, login_data.password)
+    user = authenticate_user(mongo_db, login_data.email, login_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -100,14 +118,12 @@ def instructor_login(
     login_data: UserLogin,
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     check_rate_limit(request, limit=15, window_seconds=60, key_prefix="login")
-    user = authenticate_user(db, login_data.email, login_data.password)
+    user = authenticate_user(mongo_db, login_data.email, login_data.password)
     profile = (
-        db.query(InstructorProfile)
-        .filter(InstructorProfile.user_id == user.id)
-        .first()
+        get_instructor_profile_by_user_id(mongo_db, user.id)
         if user
         else None
     )
@@ -154,6 +170,7 @@ def instructor_login(
 )
 def set_instructor_password(
     payload: InstructorPasswordSetup,
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     valid, message = validate_password_strength(payload.new_password)
@@ -161,11 +178,7 @@ def set_instructor_password(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message)
 
     token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
-    token_record = db.query(InstructorPasswordToken).filter(
-        InstructorPasswordToken.token_hash == token_hash,
-        InstructorPasswordToken.used_at.is_(None),
-        InstructorPasswordToken.purpose.in_(("setup", "reset")),
-    ).first()
+    token_record = find_unused_password_token(mongo_db, token_hash)
     now = datetime.now(timezone.utc)
     if not token_record:
         raise HTTPException(
@@ -181,25 +194,22 @@ def set_instructor_password(
             detail="This password link is invalid or has expired. Contact an administrator for a new link.",
         )
 
-    user = db.query(User).filter(User.id == token_record.user_id).first()
+    user = get_user_by_id(mongo_db, token_record.user_id)
     if not user or user.role != UserRole.INSTRUCTOR.value:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid instructor password link.")
-    claimed = db.execute(
-        update(InstructorPasswordToken)
-        .where(
-            InstructorPasswordToken.id == token_record.id,
-            InstructorPasswordToken.used_at.is_(None),
-        )
-        .values(used_at=now)
-    ).rowcount
-    if not claimed:
-        db.rollback()
+
+    if not claim_password_token(mongo_db, token_record.id, now):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This password link has already been used.",
         )
-    user.password_hash = hash_password(payload.new_password)
-    db.commit()
+    updated_user = update_user_fields(
+        mongo_db,
+        user.id,
+        {"password_hash": hash_password(payload.new_password)},
+    )
+    if updated_user:
+        sync_or_rollback_user_shadow(mongo_db, db, user, updated_user)
     return MessageResponse(message="Your instructor password has been set successfully.")
 
 
@@ -219,7 +229,7 @@ def logout(response: Response):
     response_model=UserResponse,
     summary="Get current user profile",
 )
-def get_me(current_user: User = Depends(get_current_user)):
+def get_me(current_user: MongoUser = Depends(get_current_user)):
     return current_user
 
 
@@ -230,14 +240,19 @@ def get_me(current_user: User = Depends(get_current_user)):
 )
 def update_profile(
     profile_data: UserUpdateProfile,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     if profile_data.full_name is not None:
-        current_user.full_name = profile_data.full_name.strip()
-
-    db.commit()
-    db.refresh(current_user)
+        updated = update_user_fields(
+            mongo_db,
+            current_user.id,
+            {"full_name": profile_data.full_name.strip()},
+        )
+        if updated:
+            sync_or_rollback_user_shadow(mongo_db, db, current_user, updated)
+            return updated
     return current_user
 
 
@@ -248,7 +263,8 @@ def update_profile(
 )
 def change_password(
     pwd_data: PasswordChange,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
     if not verify_password(pwd_data.current_password, current_user.hashed_password):
@@ -264,6 +280,11 @@ def change_password(
             detail=message,
         )
 
-    current_user.password_hash = hash_password(pwd_data.new_password)
-    db.commit()
+    updated = update_user_fields(
+        mongo_db,
+        current_user.id,
+        {"password_hash": hash_password(pwd_data.new_password)},
+    )
+    if updated:
+        sync_or_rollback_user_shadow(mongo_db, db, current_user, updated)
     return MessageResponse(message="Password successfully updated.")

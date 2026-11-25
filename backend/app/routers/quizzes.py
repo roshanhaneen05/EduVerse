@@ -1,12 +1,11 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_current_user, get_db
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.quiz import Quiz
-from app.models.user import User
+from app.dependencies import get_current_user, get_db, get_mongo_db
+from app.repositories.quiz_repository import list_quizzes_for_course
+from app.repositories.user_repository import MongoUser
 from app.schemas.quiz import (
     QuizAttemptResult,
     QuizAttemptSummary,
@@ -32,17 +31,17 @@ router = APIRouter(prefix="/quizzes", tags=["Quizzes & Assessments"])
 )
 def get_course_quizzes(
     course_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """Retrieve all published quizzes for an enrolled course or instructor."""
     is_manager = current_user.role in ("instructor", "admin")
-    query = db.query(Quiz).filter(Quiz.course_id == course_id)
-    if not is_manager:
-        query = query.filter(Quiz.is_published == True)
-    quizzes = query.order_by(Quiz.id.asc()).all()
-
-    return [get_quiz_for_student(db, q.id, current_user) for q in quizzes]
+    quizzes = list_quizzes_for_course(
+        mongo_db,
+        course_id,
+        published_only=not is_manager,
+    )
+    return [get_quiz_for_student(mongo_db, q.id, current_user) for q in quizzes]
 
 
 @router.get(
@@ -52,10 +51,10 @@ def get_course_quizzes(
 )
 def get_my_attempts(
     quiz_id: Optional[int] = Query(None, description="Filter attempts by quiz ID"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return list_user_attempts(db, user_id=current_user.id, quiz_id=quiz_id)
+    return list_user_attempts(mongo_db, user_id=current_user.id, quiz_id=quiz_id)
 
 
 @router.get(
@@ -65,10 +64,10 @@ def get_my_attempts(
 )
 def get_attempt(
     attempt_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_attempt_detail(db, attempt_id, current_user)
+    return get_attempt_detail(mongo_db, attempt_id, current_user)
 
 
 @router.post(
@@ -79,10 +78,11 @@ def get_attempt(
 )
 def start_quiz(
     quiz_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return start_quiz_attempt(db, quiz_id, current_user)
+    return start_quiz_attempt(mongo_db, quiz_id, current_user, sqlite_db=db)
 
 
 @router.get(
@@ -92,10 +92,10 @@ def start_quiz(
 )
 def get_quiz(
     quiz_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_quiz_for_student(db, quiz_id, current_user)
+    return get_quiz_for_student(mongo_db, quiz_id, current_user)
 
 
 @router.post(
@@ -106,7 +106,8 @@ def get_quiz(
 def submit_quiz(
     quiz_id: int,
     submission: QuizSubmission,
-    current_user: User = Depends(get_current_user),
+    current_user: MongoUser = Depends(get_current_user),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return evaluate_quiz_submission(db, quiz_id, current_user, submission)
+    return evaluate_quiz_submission(mongo_db, quiz_id, current_user, submission, sqlite_db=db)

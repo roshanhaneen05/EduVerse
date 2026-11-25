@@ -1,15 +1,32 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
+from sqlalchemy.orm import Session
 
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.material import LearningMaterial
-from app.models.section import CourseSection
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.quiz import Quiz
-from app.models.user import User
+from app.repositories.assignment_repository import (
+    list_assignments_for_course,
+    list_submissions_for_student_assignments,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    create_course_doc,
+    delete_course_cascade_mongo,
+    get_completed_lesson_ids,
+    get_course_by_id,
+    get_enrollment_by_student_and_course,
+    list_courses_filtered,
+    list_lessons_for_course,
+    list_sections_for_course,
+    restore_course_snapshot,
+    sync_course_to_sqlite_shadow,
+    update_course_doc,
+)
+from app.repositories.material_repository import list_materials_for_course
+from app.repositories.quiz_repository import (
+    count_questions_by_quiz_ids,
+    list_quizzes_for_course,
+)
+from app.repositories.user_repository import MongoUser, get_user_by_id, get_users_by_ids
 from app.schemas.course import (
     AssignmentOutlineItem,
     CourseCreate,
@@ -23,14 +40,29 @@ from app.schemas.course import (
 )
 
 
-def enrich_course_response(db: Session, course: Course) -> CourseResponse:
-    """Convert Course ORM model to CourseResponse."""
+def enrich_course_response(
+    mongo_db: Database | Session,
+    course: MongoCourse,
+    instructor_cache: Optional[Dict[int, MongoUser]] = None,
+) -> CourseResponse:
+    """Convert Course model (MongoDB or transitional SQLAlchemy ORM) to CourseResponse."""
+    if instructor_cache is not None:
+        instructor_doc = instructor_cache.get(course.instructor_id)
+    elif isinstance(mongo_db, Session):
+        instructor_doc = getattr(course, "instructor", None)
+        if instructor_doc is None:
+            from app.models.user import User
+
+            instructor_doc = mongo_db.query(User).filter(User.id == course.instructor_id).first()
+    else:
+        instructor_doc = get_user_by_id(mongo_db, course.instructor_id)
+
     instructor = None
-    if course.instructor:
+    if instructor_doc:
         instructor = InstructorSummary(
-            id=course.instructor.id,
-            full_name=course.instructor.full_name,
-            email=course.instructor.email,
+            id=instructor_doc.id,
+            full_name=instructor_doc.full_name,
+            email=instructor_doc.email,
         )
 
     return CourseResponse(
@@ -48,7 +80,7 @@ def enrich_course_response(db: Session, course: Course) -> CourseResponse:
 
 
 def list_courses(
-    db: Session,
+    mongo_db: Database,
     search: Optional[str] = None,
     category: Optional[str] = None,
     difficulty: Optional[str] = None,
@@ -57,48 +89,35 @@ def list_courses(
     skip: int = 0,
     limit: int = 50,
 ) -> List[CourseResponse]:
-    """Retrieve filtered courses with pagination."""
-    query = db.query(Course).options(joinedload(Course.instructor))
-
-    if is_published is not None:
-        query = query.filter(Course.is_published == is_published)
-    if instructor_id is not None:
-        query = query.filter(Course.instructor_id == instructor_id)
-    if category:
-        query = query.filter(Course.category.ilike(f"%{category}%"))
-    if difficulty:
-        query = query.filter(Course.difficulty.ilike(difficulty))
-    if search:
-        search_filter = f"%{search.strip()}%"
-        query = query.filter(
-            (Course.title.ilike(search_filter))
-            | (Course.description.ilike(search_filter))
-            | (Course.category.ilike(search_filter))
-        )
-
-    courses = query.order_by(Course.created_at.desc()).offset(skip).limit(limit).all()
-    return [enrich_course_response(db, c) for c in courses]
+    """Retrieve filtered courses from MongoDB with pagination."""
+    courses = list_courses_filtered(
+        mongo_db,
+        search=search,
+        category=category,
+        difficulty=difficulty,
+        is_published=is_published,
+        instructor_id=instructor_id,
+        skip=skip,
+        limit=limit,
+    )
+    instructor_map = get_users_by_ids(mongo_db, [c.instructor_id for c in courses])
+    return [enrich_course_response(mongo_db, c, instructor_cache=instructor_map) for c in courses]
 
 
 def get_course_detail(
-    db: Session,
+    mongo_db: Database,
     course_id: int,
-    current_user: Optional[User] = None,
+    current_user: Optional[MongoUser] = None,
 ) -> CourseDetailResponse:
-    """Get full course detail including outline and user-specific progress."""
-    course = (
-        db.query(Course)
-        .options(joinedload(Course.instructor))
-        .filter(Course.id == course_id)
-        .first()
-    )
+    """Get full course detail from MongoDB across courses, sections, lessons, quizzes, assignments, materials."""
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found.",
         )
 
-    base_response = enrich_course_response(db, course)
+    base_response = enrich_course_response(mongo_db, course)
 
     is_enrolled = False
     completion_percentage = 0.0
@@ -106,41 +125,26 @@ def get_course_detail(
     completed_lesson_ids = set()
 
     if current_user:
-        enrollment = (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.student_id == current_user.id,
-                CourseEnrollment.course_id == course_id,
-            )
-            .first()
-        )
+        enrollment = get_enrollment_by_student_and_course(mongo_db, current_user.id, course_id)
         if enrollment:
             enrollment_status = enrollment.status
             is_enrolled = enrollment.status == "approved"
             if is_enrolled:
                 completion_percentage = enrollment.completion_percentage
 
-            progress_records = (
-                db.query(LessonProgress.lesson_id)
-                .filter(
-                    LessonProgress.student_id == current_user.id,
-                    LessonProgress.is_completed == True,
-                )
-                .all()
-            ) if is_enrolled else []
-            completed_lesson_ids = {r[0] for r in progress_records}
-
     restrict_course_content = bool(
         current_user
         and current_user.role == "student"
         and enrollment_status != "approved"
     )
-    lessons = (
-        db.query(Lesson)
-        .filter(Lesson.course_id == course_id)
-        .order_by(Lesson.order_index.asc())
-        .all()
-    ) if not restrict_course_content else []
+    lessons = list_lessons_for_course(mongo_db, course_id) if not restrict_course_content else []
+    if current_user and is_enrolled and lessons:
+        completed_lesson_ids = get_completed_lesson_ids(
+            mongo_db,
+            current_user.id,
+            [l.id for l in lessons],
+        )
+
     lesson_items = [
         LessonOutlineItem(
             id=l.id,
@@ -154,12 +158,7 @@ def get_course_detail(
         for l in lessons
     ]
 
-    sections = (
-        db.query(CourseSection)
-        .filter(CourseSection.course_id == course_id)
-        .order_by(CourseSection.order_index.asc())
-        .all()
-    ) if not restrict_course_content else []
+    sections = list_sections_for_course(mongo_db, course_id) if not restrict_course_content else []
     section_items = []
     for s in sections:
         sec_lessons = [item for item in lesson_items if item.section_id == s.id]
@@ -175,11 +174,13 @@ def get_course_detail(
             "lessons": sec_lessons,
         })
 
-    is_manager = current_user and current_user.role in ("instructor", "admin")
-    quiz_query = db.query(Quiz).filter(Quiz.course_id == course_id)
-    if not is_manager:
-        quiz_query = quiz_query.filter(Quiz.is_published == True)
-    quizzes = [] if restrict_course_content else quiz_query.order_by(Quiz.id.asc()).all()
+    is_manager = bool(current_user and current_user.role in ("instructor", "admin"))
+    quizzes = (
+        []
+        if restrict_course_content
+        else list_quizzes_for_course(mongo_db, course_id, published_only=not is_manager)
+    )
+    question_counts = count_questions_by_quiz_ids(mongo_db, [q.id for q in quizzes])
 
     quiz_items = [
         QuizOutlineItem(
@@ -193,35 +194,33 @@ def get_course_detail(
             max_attempts=q.max_attempts,
             section_id=q.section_id,
             lesson_id=q.lesson_id,
-            question_count=len(q.questions) if q.questions else 0,
+            question_count=question_counts.get(q.id, 0),
         )
         for q in quizzes
     ]
 
-    # Assignments
-    assignment_query = db.query(Assignment).filter(
-        Assignment.course_id == course_id,
-        Assignment.is_archived == False,
+    is_course_owner_or_admin = bool(
+        current_user and (current_user.role == "admin" or course.instructor_id == current_user.id)
     )
-    if not current_user or (current_user.role != "admin" and course.instructor_id != current_user.id):
-        assignment_query = assignment_query.filter(Assignment.is_published == True)
-
     assignments = (
-        [] if restrict_course_content else assignment_query.order_by(Assignment.created_at.asc()).all()
+        []
+        if restrict_course_content
+        else list_assignments_for_course(
+            mongo_db,
+            course_id,
+            published_only=not is_course_owner_or_admin,
+            exclude_archived=True,
+            sort_asc=True,
+        )
     )
 
     user_submissions = {}
     if current_user and assignments:
-        assignment_ids = [a.id for a in assignments]
-        subs = (
-            db.query(AssignmentSubmission)
-            .filter(
-                AssignmentSubmission.student_id == current_user.id,
-                AssignmentSubmission.assignment_id.in_(assignment_ids),
-            )
-            .all()
+        user_submissions = list_submissions_for_student_assignments(
+            mongo_db,
+            current_user.id,
+            [a.id for a in assignments],
         )
-        user_submissions = {s.assignment_id: s for s in subs}
 
     assignment_items = [
         AssignmentOutlineItem(
@@ -239,15 +238,9 @@ def get_course_detail(
         for a in assignments
     ]
 
-    # Learning Materials (accessible by enrolled students, course instructor, or admin)
     material_items = []
-    if current_user and (is_enrolled or current_user.role == "admin" or course.instructor_id == current_user.id):
-        raw_materials = (
-            db.query(LearningMaterial)
-            .filter(LearningMaterial.course_id == course_id)
-            .order_by(LearningMaterial.created_at.desc())
-            .all()
-        )
+    if current_user and (is_enrolled or is_course_owner_or_admin):
+        raw_materials = list_materials_for_course(mongo_db, course_id)
         for m in raw_materials:
             ext = m.original_filename.rsplit(".", 1)[1].upper() if "." in m.original_filename else "FILE"
             bytes_val = m.file_size
@@ -287,8 +280,14 @@ def get_course_detail(
     )
 
 
-def create_course(db: Session, course_in: CourseCreate, instructor_id: int) -> Course:
-    course = Course(
+def create_course(
+    mongo_db: Database,
+    course_in: CourseCreate,
+    instructor_id: int,
+    sqlite_db: Optional[Session] = None,
+) -> MongoCourse:
+    course = create_course_doc(
+        mongo_db,
         title=course_in.title.strip(),
         description=course_in.description.strip(),
         category=course_in.category.strip(),
@@ -296,24 +295,38 @@ def create_course(db: Session, course_in: CourseCreate, instructor_id: int) -> C
         is_published=course_in.is_published,
         instructor_id=instructor_id,
     )
-    db.add(course)
-    db.commit()
-    db.refresh(course)
+    try:
+        sync_course_to_sqlite_shadow(sqlite_db, course)
+    except Exception:
+        delete_course_cascade_mongo(mongo_db, course.id)
+        raise
     return course
 
 
-def update_course(db: Session, course: Course, course_in: CourseUpdate) -> Course:
+def update_course(
+    mongo_db: Database,
+    course: MongoCourse,
+    course_in: CourseUpdate,
+    sqlite_db: Optional[Session] = None,
+) -> MongoCourse:
+    updates: dict = {}
     if course_in.title is not None:
-        course.title = course_in.title.strip()
+        updates["title"] = course_in.title.strip()
     if course_in.description is not None:
-        course.description = course_in.description.strip()
+        updates["description"] = course_in.description.strip()
     if course_in.category is not None:
-        course.category = course_in.category.strip()
+        updates["category"] = course_in.category.strip()
     if course_in.difficulty is not None:
-        course.difficulty = course_in.difficulty
+        updates["difficulty"] = course_in.difficulty
     if course_in.is_published is not None:
-        course.is_published = course_in.is_published
+        updates["is_published"] = course_in.is_published
 
-    db.commit()
-    db.refresh(course)
-    return course
+    updated = update_course_doc(mongo_db, course.id, updates) if updates else course
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    try:
+        sync_course_to_sqlite_shadow(sqlite_db, updated)
+    except Exception:
+        restore_course_snapshot(mongo_db, course)
+        raise
+    return updated

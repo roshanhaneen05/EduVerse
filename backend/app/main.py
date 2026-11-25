@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.database import check_db_connection
+from app.mongodb import close_mongo_client, init_mongo_client
 from app.routers import (
     admin_router,
     ai_router,
@@ -35,7 +36,11 @@ async def lifespan(app: FastAPI):
     settings.resolved_data_dir
     settings.resolved_upload_dir
     check_db_connection()
-    yield
+    init_mongo_client()
+    try:
+        yield
+    finally:
+        close_mongo_client()
 
 
 app = FastAPI(

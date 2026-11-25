@@ -1,25 +1,58 @@
 import logging
 import math
 import smtplib
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import func
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.dependencies import get_db, require_admin
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.email_delivery import EmailDelivery
-from app.models.enrollment import CourseEnrollment
-from app.models.instructor import InstructorProfile
-from app.models.lesson import Lesson
-from app.models.material import LearningMaterial
-from app.models.quiz import Quiz, QuizAttempt
-from app.models.user import User, UserRole
+from app.dependencies import get_db, get_mongo_db, require_admin
+from app.models.user import UserRole
+from app.repositories.assignment_repository import (
+    count_all_assignments,
+    count_all_submissions,
+    count_assignments_by_course_ids,
+)
+from app.repositories.communication_repository import (
+    get_email_delivery_by_id,
+    list_email_deliveries_by_status,
+    sync_email_delivery_to_sqlite_shadow,
+)
+from app.repositories.course_repository import (
+    count_enrollments_by_course_ids,
+    count_lessons_by_course_ids,
+    get_course_by_id,
+    get_courses_by_ids,
+    get_distinct_course_categories,
+    list_all_courses,
+    list_courses_paginated,
+    list_enrollments,
+    restore_course_snapshot,
+    sync_course_to_sqlite_shadow,
+    update_course_doc,
+)
+from app.repositories.material_repository import count_all_materials
+from app.repositories.quiz_repository import (
+    count_quiz_attempts,
+    count_quizzes_by_course_ids,
+    get_quiz_by_id,
+    list_quiz_attempts,
+)
+from app.repositories.user_repository import (
+    MongoUser,
+    count_users,
+    ensure_instructor_profile_for_user,
+    get_user_by_id,
+    get_users_by_ids,
+    list_recent_users,
+    list_users_paginated,
+    sync_or_rollback_user_shadow,
+    update_user_fields,
+)
 from app.schemas.admin import (
     AdminCourseItem,
     AdminRecentActivity,
@@ -68,7 +101,7 @@ class EmailTestRequest(BaseModel):
 )
 def test_email_configuration(
     request: EmailTestRequest,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
 ):
     if settings.ENVIRONMENT.lower() != "development":
         raise HTTPException(
@@ -107,10 +140,11 @@ def test_email_configuration(
 )
 def retry_email_delivery(
     delivery_id: int,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    delivery = db.query(EmailDelivery).filter(EmailDelivery.id == delivery_id).first()
+    delivery = get_email_delivery_by_id(mongo_db, delivery_id)
     if not delivery:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email delivery not found.")
     if delivery.status not in ("failed", "pending"):
@@ -119,7 +153,10 @@ def retry_email_delivery(
             detail="Only pending or failed email notifications can be retried.",
         )
 
-    result = send_email_delivery(db, delivery, settings)
+    result = send_email_delivery(mongo_db, delivery, settings)
+    latest = get_email_delivery_by_id(mongo_db, delivery_id)
+    if latest is not None:
+        sync_email_delivery_to_sqlite_shadow(db, latest)
     if result == "sent":
         return MessageResponse(message="Email server accepted the notification for delivery.")
     if result == "not_configured":
@@ -134,20 +171,15 @@ def retry_email_delivery(
 )
 def list_email_deliveries(
     delivery_status: str = Query("failed", alias="status"),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     if delivery_status not in ("pending", "failed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Delivery status must be pending or failed.",
         )
-    return (
-        db.query(EmailDelivery)
-        .filter(EmailDelivery.status == delivery_status)
-        .order_by(EmailDelivery.updated_at.asc())
-        .all()
-    )
+    return list_email_deliveries_by_status(mongo_db, delivery_status)
 
 
 @router.get(
@@ -156,36 +188,34 @@ def list_email_deliveries(
     summary="Get overall platform statistics and recent activity for administrator dashboard",
 )
 def get_platform_statistics(
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    total_users = db.query(func.count(User.id)).scalar() or 0
-    total_students = db.query(func.count(User.id)).filter(User.role == UserRole.STUDENT.value).scalar() or 0
-    total_instructors = db.query(func.count(User.id)).filter(User.role == UserRole.INSTRUCTOR.value).scalar() or 0
-    total_admins = db.query(func.count(User.id)).filter(User.role == UserRole.ADMIN.value).scalar() or 0
+    total_users = count_users(mongo_db)
+    total_students = count_users(mongo_db, role=UserRole.STUDENT.value)
+    total_instructors = count_users(mongo_db, role=UserRole.INSTRUCTOR.value)
+    total_admins = count_users(mongo_db, role=UserRole.ADMIN.value)
 
-    total_courses = db.query(func.count(Course.id)).scalar() or 0
-    published_courses = db.query(func.count(Course.id)).filter(Course.is_published == True).scalar() or 0
-    total_enrollments = db.query(func.count(CourseEnrollment.id)).scalar() or 0
+    all_courses = list_all_courses(mongo_db)
+    total_courses = len(all_courses)
+    published_courses = sum(1 for c in all_courses if c.is_published)
+    total_enrollments = int(mongo_db["course_enrollments"].count_documents({}))
 
-    total_attempts = db.query(func.count(QuizAttempt.id)).scalar() or 0
-    passed_attempts = db.query(func.count(QuizAttempt.id)).filter(QuizAttempt.passed == True).scalar() or 0
-    avg_pass_rate = round((passed_attempts / total_attempts) * 100.0, 1) if total_attempts > 0 else 0.0
+    total_attempts = count_quiz_attempts(mongo_db)
+    passed_attempts = count_quiz_attempts(mongo_db, passed_only=True)
+    avg_pass_rate = (
+        round((passed_attempts / total_attempts) * 100.0, 1)
+        if total_attempts > 0
+        else 0.0
+    )
 
-    total_assignments = db.query(func.count(Assignment.id)).scalar() or 0
-    total_submissions = db.query(func.count(AssignmentSubmission.id)).scalar() or 0
-    total_materials = db.query(func.count(LearningMaterial.id)).scalar() or 0
+    total_assignments = count_all_assignments(mongo_db)
+    total_submissions = count_all_submissions(mongo_db)
+    total_materials = count_all_materials(mongo_db)
 
-    # Collect recent platform activities across models
     activities: List[AdminRecentActivity] = []
 
-    # 1. Recent user registrations
-    recent_users = (
-        db.query(User)
-        .order_by(User.created_at.desc())
-        .limit(5)
-        .all()
-    )
+    recent_users = list_recent_users(mongo_db, limit=5)
     for u in recent_users:
         activities.append(
             AdminRecentActivity(
@@ -199,81 +229,83 @@ def get_platform_statistics(
             )
         )
 
-    # 2. Recent course enrollments
-    recent_enrollments = (
-        db.query(CourseEnrollment)
-        .join(User, CourseEnrollment.student_id == User.id)
-        .join(Course, CourseEnrollment.course_id == Course.id)
-        .order_by(CourseEnrollment.enrolled_at.desc())
-        .limit(5)
-        .all()
+    recent_enrollments = list_enrollments(mongo_db, sort_desc=True, limit=5)
+    recent_courses = all_courses[:5]
+    recent_quiz_attempts = sorted(
+        list_quiz_attempts(mongo_db),
+        key=lambda qa: qa.started_at,
+        reverse=True,
+    )[:5]
+
+    user_ids_needed = (
+        [e.student_id for e in recent_enrollments]
+        + [c.instructor_id for c in recent_courses]
+        + [qa.student_id for qa in recent_quiz_attempts]
     )
+    users_map = get_users_by_ids(mongo_db, user_ids_needed)
+    courses_map = {c.id: c for c in all_courses}
+
     for e in recent_enrollments:
-        student_name = e.student.full_name if e.student else "Student"
-        student_email = e.student.email if e.student else None
-        course_title = e.course.title if e.course else "Course"
+        student = users_map.get(e.student_id)
+        course = courses_map.get(e.course_id)
+        if not student or not course:
+            continue
         activities.append(
             AdminRecentActivity(
                 activity_type="course_enrolled",
-                title=f"Enrollment: {student_name}",
-                description=f"Enrolled in '{course_title}'",
+                title=f"Enrollment: {student.full_name}",
+                description=f"Enrolled in '{course.title}'",
                 timestamp=e.enrolled_at,
-                user_name=student_name,
-                user_email=student_email,
+                user_name=student.full_name,
+                user_email=student.email,
                 reference_id=e.id,
             )
         )
 
-    # 3. Recent course creations
-    recent_courses = (
-        db.query(Course)
-        .join(User, Course.instructor_id == User.id)
-        .order_by(Course.created_at.desc())
-        .limit(5)
-        .all()
-    )
     for c in recent_courses:
-        inst_name = c.instructor.full_name if c.instructor else "Instructor"
-        inst_email = c.instructor.email if c.instructor else None
+        inst = users_map.get(c.instructor_id)
+        if not inst:
+            continue
         activities.append(
             AdminRecentActivity(
                 activity_type="course_created",
                 title=f"Course Created: {c.title}",
-                description=f"Authored by {inst_name} ({c.category})",
+                description=f"Authored by {inst.full_name} ({c.category})",
                 timestamp=c.created_at,
-                user_name=inst_name,
-                user_email=inst_email,
+                user_name=inst.full_name,
+                user_email=inst.email,
                 reference_id=c.id,
             )
         )
 
-    # 4. Recent quiz attempts
-    recent_quiz_attempts = (
-        db.query(QuizAttempt)
-        .join(User, QuizAttempt.student_id == User.id)
-        .join(Quiz, QuizAttempt.quiz_id == Quiz.id)
-        .order_by(QuizAttempt.started_at.desc())
-        .limit(5)
-        .all()
-    )
+    quiz_cache = {}
     for qa in recent_quiz_attempts:
-        uname = qa.student.full_name if qa.student else "Student"
-        uemail = qa.student.email if qa.student else None
-        qtitle = qa.quiz.title if qa.quiz else "Assessment"
+        user_obj = users_map.get(qa.student_id)
+        if not user_obj or qa.quiz_id is None:
+            continue
+        if qa.quiz_id not in quiz_cache:
+            quiz_cache[qa.quiz_id] = get_quiz_by_id(mongo_db, qa.quiz_id)
+        quiz_obj = quiz_cache.get(qa.quiz_id)
+        if not quiz_obj:
+            continue
         activities.append(
             AdminRecentActivity(
                 activity_type="quiz_attempt",
-                title=f"Assessment: {uname}",
-                description=f"{'Passed' if qa.passed else 'Attempted'} '{qtitle}' with score {qa.score:.1f}%",
+                title=f"Assessment: {user_obj.full_name}",
+                description=f"{'Passed' if qa.passed else 'Attempted'} '{quiz_obj.title}' with score {qa.score:.1f}%",
                 timestamp=qa.started_at,
-                user_name=uname,
-                user_email=uemail,
+                user_name=user_obj.full_name,
+                user_email=user_obj.email,
                 reference_id=qa.id,
             )
         )
 
-    # Sort all blended activities chronologically
-    activities.sort(key=lambda x: x.timestamp, reverse=True)
+    activities.sort(
+        key=lambda x: x.timestamp
+        if x.timestamp.tzinfo is not None
+        else x.timestamp.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
     recent_activities = activities[:10]
 
     return PlatformStats(
@@ -304,25 +336,16 @@ def list_platform_users(
     is_active: Optional[bool] = Query(None, description="Filter by active status"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(10, ge=1, le=100, description="Items per page"),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    query = db.query(User)
-    if role:
-        query = query.filter(User.role == role)
-    if is_active is not None:
-        query = query.filter(User.is_active == is_active)
-    if search:
-        s = f"%{search.strip()}%"
-        query = query.filter((User.email.ilike(s)) | (User.full_name.ilike(s)))
-
-    total = query.count()
-    total_pages = math.ceil(total / page_size) if total > 0 else 1
-    users = (
-        query.order_by(User.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
+    total, total_pages, users = list_users_paginated(
+        mongo_db,
+        search=search,
+        role=role,
+        is_active=is_active,
+        page=page,
+        page_size=page_size,
     )
 
     return PaginatedUserResponse(
@@ -342,10 +365,11 @@ def list_platform_users(
 def update_user_status_or_role(
     user_id: int,
     user_update: UserAdminUpdate,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id).first()
+    user = get_user_by_id(mongo_db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
@@ -367,6 +391,7 @@ def update_user_status_or_role(
             detail="Administrators cannot demote their own account role.",
         )
 
+    updates: dict = {}
     if user_update.role is not None:
         valid_roles = [r.value for r in UserRole]
         if user_update.role not in valid_roles:
@@ -374,22 +399,24 @@ def update_user_status_or_role(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid role. Must be one of {valid_roles}",
             )
-        user.role = user_update.role
-        if user.role == UserRole.INSTRUCTOR.value and not user.instructor_profile:
-            user.instructor_profile = InstructorProfile(
-                instructor_id=f"EV-I-{user.id:08d}",
-                registered_at=user.created_at,
-            )
+        updates["role"] = user_update.role
 
     if user_update.is_active is not None:
-        user.is_active = user_update.is_active
+        updates["is_active"] = user_update.is_active
 
     if user_update.full_name is not None:
-        user.full_name = user_update.full_name.strip()
+        updates["full_name"] = user_update.full_name.strip()
 
-    db.commit()
-    db.refresh(user)
-    return UserResponse.model_validate(user)
+    updated_user = update_user_fields(mongo_db, user.id, updates) if updates else user
+    if updated_user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    profile = None
+    if updated_user.role == UserRole.INSTRUCTOR.value:
+        profile = ensure_instructor_profile_for_user(mongo_db, updated_user)
+
+    sync_or_rollback_user_shadow(mongo_db, db, user, updated_user, profile=profile)
+    return UserResponse.model_validate(updated_user)
 
 
 @router.get(
@@ -404,28 +431,19 @@ def list_platform_courses(
     is_published: Optional[bool] = Query(None, description="Filter by published status"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(10, ge=1, le=100, description="Items per page"),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    query = db.query(Course)
-    if is_published is not None:
-        query = query.filter(Course.is_published == is_published)
-    if category:
-        query = query.filter(Course.category == category)
-    if difficulty:
-        query = query.filter(Course.difficulty == difficulty)
-    if search:
-        s = f"%{search.strip()}%"
-        query = query.filter((Course.title.ilike(s)) | (Course.description.ilike(s)))
-
-    total = query.count()
-    total_pages = math.ceil(total / page_size) if total > 0 else 1
-    courses = (
-        query.order_by(Course.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
+    total, courses = list_courses_paginated(
+        mongo_db,
+        search=search,
+        category=category,
+        difficulty=difficulty,
+        is_published=is_published,
+        page=page,
+        page_size=page_size,
     )
+    total_pages = math.ceil(total / page_size) if total > 0 else 1
 
     if not courses:
         return PaginatedAdminCourseResponse(
@@ -437,40 +455,18 @@ def list_platform_courses(
         )
 
     course_ids = [c.id for c in courses]
+    instructor_map = get_users_by_ids(mongo_db, [c.instructor_id for c in courses])
 
-    # Batch aggregation queries (O(1) database trips)
-    enrollment_counts = dict(
-        db.query(CourseEnrollment.course_id, func.count(CourseEnrollment.id))
-        .filter(CourseEnrollment.course_id.in_(course_ids))
-        .group_by(CourseEnrollment.course_id)
-        .all()
-    )
-
-    lesson_counts = dict(
-        db.query(Lesson.course_id, func.count(Lesson.id))
-        .filter(Lesson.course_id.in_(course_ids))
-        .group_by(Lesson.course_id)
-        .all()
-    )
-
-    quiz_counts = dict(
-        db.query(Quiz.course_id, func.count(Quiz.id))
-        .filter(Quiz.course_id.in_(course_ids))
-        .group_by(Quiz.course_id)
-        .all()
-    )
-
-    assignment_counts = dict(
-        db.query(Assignment.course_id, func.count(Assignment.id))
-        .filter(Assignment.course_id.in_(course_ids))
-        .group_by(Assignment.course_id)
-        .all()
-    )
+    enrollment_counts = count_enrollments_by_course_ids(mongo_db, course_ids)
+    lesson_counts = count_lessons_by_course_ids(mongo_db, course_ids)
+    quiz_counts = count_quizzes_by_course_ids(mongo_db, course_ids)
+    assignment_counts = count_assignments_by_course_ids(mongo_db, course_ids)
 
     items: List[AdminCourseItem] = []
     for c in courses:
-        inst_name = c.instructor.full_name if c.instructor else "Unknown Instructor"
-        inst_email = c.instructor.email if c.instructor else "unknown@eduverse.io"
+        inst = instructor_map.get(c.instructor_id)
+        inst_name = inst.full_name if inst else "Unknown Instructor"
+        inst_email = inst.email if inst else "unknown@eduverse.io"
         items.append(
             AdminCourseItem(
                 id=c.id,
@@ -506,11 +502,10 @@ def list_platform_courses(
     summary="Get list of distinct course categories for filter controls",
 )
 def get_admin_course_categories(
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    rows = db.query(Course.category).distinct().all()
-    return sorted([r[0] for r in rows if r[0]])
+    return get_distinct_course_categories(mongo_db)
 
 
 @router.patch(
@@ -520,49 +515,56 @@ def get_admin_course_categories(
 )
 def admin_toggle_publish(
     course_id: int,
-    current_user: User = Depends(require_admin),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
 
-    course.is_published = not course.is_published
-    db.commit()
-    db.refresh(course)
+    updated = update_course_doc(mongo_db, course.id, {"is_published": not course.is_published})
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    try:
+        sync_course_to_sqlite_shadow(db, updated)
+    except Exception:
+        restore_course_snapshot(mongo_db, course)
+        raise
 
-    enrolled = db.query(func.count(CourseEnrollment.id)).filter(CourseEnrollment.course_id == course.id).scalar() or 0
-    lessons = db.query(func.count(Lesson.id)).filter(Lesson.course_id == course.id).scalar() or 0
-    quizzes = db.query(func.count(Quiz.id)).filter(Quiz.course_id == course.id).scalar() or 0
-    assignments = db.query(func.count(Assignment.id)).filter(Assignment.course_id == course.id).scalar() or 0
+    enrolled = count_enrollments_by_course_ids(mongo_db, [updated.id]).get(updated.id, 0)
+    lessons = count_lessons_by_course_ids(mongo_db, [updated.id]).get(updated.id, 0)
+    quizzes = count_quizzes_by_course_ids(mongo_db, [updated.id]).get(updated.id, 0)
+    assignments = count_assignments_by_course_ids(mongo_db, [updated.id]).get(updated.id, 0)
 
-    inst_name = course.instructor.full_name if course.instructor else "Unknown Instructor"
-    inst_email = course.instructor.email if course.instructor else "unknown@eduverse.io"
+    inst = get_user_by_id(mongo_db, updated.instructor_id)
+    inst_name = inst.full_name if inst else "Unknown Instructor"
+    inst_email = inst.email if inst else "unknown@eduverse.io"
 
     return AdminCourseItem(
-        id=course.id,
-        title=course.title,
-        description=course.description,
-        category=course.category,
-        difficulty=course.difficulty,
-        is_published=course.is_published,
-        instructor_id=course.instructor_id,
+        id=updated.id,
+        title=updated.title,
+        description=updated.description,
+        category=updated.category,
+        difficulty=updated.difficulty,
+        is_published=updated.is_published,
+        instructor_id=updated.instructor_id,
         instructor_name=inst_name,
         instructor_email=inst_email,
         enrolled_students_count=enrolled,
         lesson_count=lessons,
         quiz_count=quizzes,
         assignment_count=assignments,
-        created_at=course.created_at,
-        updated_at=course.updated_at,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
     )
 
 
 def _admin_analytics(
-    db: Session, start_date: Optional[date], end_date: Optional[date]
+    mongo_db: Database, start_date: Optional[date], end_date: Optional[date]
 ) -> AdminAnalyticsDashboard:
     try:
-        return build_admin_analytics(db, start_date, end_date)
+        return build_admin_analytics(mongo_db, start_date, end_date)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
@@ -577,10 +579,10 @@ def _admin_analytics(
 def get_admin_analytics_dashboard(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date)
+    return _admin_analytics(mongo_db, start_date, end_date)
 
 
 @router.get(
@@ -591,10 +593,10 @@ def get_admin_analytics_dashboard(
 def get_admin_analytics_overview(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date).overview
+    return _admin_analytics(mongo_db, start_date, end_date).overview
 
 
 @router.get(
@@ -605,10 +607,10 @@ def get_admin_analytics_overview(
 def get_admin_student_analytics(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date).students
+    return _admin_analytics(mongo_db, start_date, end_date).students
 
 
 @router.get(
@@ -619,10 +621,10 @@ def get_admin_student_analytics(
 def get_admin_course_analytics(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date).courses
+    return _admin_analytics(mongo_db, start_date, end_date).courses
 
 
 @router.get(
@@ -633,10 +635,10 @@ def get_admin_course_analytics(
 def get_admin_instructor_analytics(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date).instructors
+    return _admin_analytics(mongo_db, start_date, end_date).instructors
 
 
 @router.get(
@@ -647,10 +649,10 @@ def get_admin_instructor_analytics(
 def get_admin_analytics_trends(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date).trends
+    return _admin_analytics(mongo_db, start_date, end_date).trends
 
 
 @router.get(
@@ -661,10 +663,10 @@ def get_admin_analytics_trends(
 def get_admin_analytics_activities(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return _admin_analytics(db, start_date, end_date).recent_activities
+    return _admin_analytics(mongo_db, start_date, end_date).recent_activities
 
 
 @router.get(
@@ -675,10 +677,10 @@ def export_admin_analytics(
     report_format: str = Query("csv", alias="format", pattern="^(csv|pdf)$"),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_admin),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    data = _admin_analytics(db, start_date, end_date)
+    data = _admin_analytics(mongo_db, start_date, end_date)
     if report_format == "csv":
         return Response(
             content=analytics_csv_report(data),

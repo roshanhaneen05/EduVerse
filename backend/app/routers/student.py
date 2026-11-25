@@ -1,9 +1,9 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Query
+from pymongo.database import Database
 
-from app.dependencies import get_db, require_student
-from app.models.user import User
+from app.dependencies import get_mongo_db, require_student
+from app.repositories.user_repository import MongoUser
 from app.schemas.course import CourseResponse
 from app.schemas.student import (
     ContinueLearningResponse,
@@ -30,8 +30,8 @@ router = APIRouter(prefix="/student", tags=["Student Experience & Learning"])
     summary="Get comprehensive student dashboard metrics, deadlines, and real telemetry",
 )
 def get_student_dashboard(
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Returns enhanced student dashboard with accurate metrics:
@@ -42,7 +42,7 @@ def get_student_dashboard(
     - Recent assessment grades (quizzes + graded assignments)
     - Course recommendations based on enrolled categories
     """
-    return get_student_dashboard_data(db, current_user.id)
+    return get_student_dashboard_data(mongo_db, current_user.id)
 
 
 @router.get(
@@ -52,14 +52,14 @@ def get_student_dashboard(
 )
 def get_my_learning(
     status: Optional[str] = Query(None, description="Filter by status ('all', 'in_progress', 'completed')"),
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Returns the student's enrolled courses with completed/remaining lesson counts,
     progress percentage, and next lesson ID for one-click continuation.
     """
-    return list_student_enrolled_courses(db, current_user.id, status_filter=status)
+    return list_student_enrolled_courses(mongo_db, current_user.id, status_filter=status)
 
 
 @router.get(
@@ -69,8 +69,8 @@ def get_my_learning(
 )
 def continue_course_learning(
     course_id: int,
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Determines the next lesson to continue:
@@ -78,7 +78,7 @@ def continue_course_learning(
     - First incomplete lesson by order_index
     - First lesson for review if entire course is completed
     """
-    return get_continue_learning_lesson(db, current_user.id, course_id)
+    return get_continue_learning_lesson(mongo_db, current_user.id, course_id)
 
 
 @router.get(
@@ -88,14 +88,14 @@ def continue_course_learning(
 )
 def get_student_assignments(
     filter: Optional[str] = Query(None, description="Filter by status ('all', 'pending', 'submitted', 'graded', 'past_due')"),
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Returns all published assignments across the student's enrolled courses,
     displaying personal submission state, deadlines, grades, and feedback.
     """
-    return list_student_assignments(db, current_user.id, filter_status=filter)
+    return list_student_assignments(mongo_db, current_user.id, filter_status=filter)
 
 
 @router.get(
@@ -104,14 +104,14 @@ def get_student_assignments(
     summary="Get student quiz examination history",
 )
 def get_student_quiz_history(
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Returns past quiz attempts for the student with scores and pass/fail states.
     Strictly excludes answer keys and other students' data.
     """
-    return list_student_quiz_history(db, current_user.id)
+    return list_student_quiz_history(mongo_db, current_user.id)
 
 
 @router.get(
@@ -121,11 +121,11 @@ def get_student_quiz_history(
 )
 def get_course_recommendations(
     limit: int = Query(4, ge=1, le=10, description="Max recommendations to return"),
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
     """
     Suggests published courses in categories the student has expressed interest in,
     strictly excluding courses the student is already enrolled in.
     """
-    return get_recommended_courses(db, current_user.id, limit=limit)
+    return get_recommended_courses(mongo_db, current_user.id, limit=limit)

@@ -4,16 +4,43 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session, joinedload
+from pymongo.database import Database
+from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models.ai import AIConversation, AIMessage
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson, LessonProgress
-from app.models.quiz import Quiz, QuizAttempt
-from app.models.user import User
+from app.repositories.ai_repository import (
+    count_ai_messages_by_conversation_ids,
+    create_ai_conversation_doc,
+    create_ai_message_doc,
+    delete_ai_conversation_cascade_mongo,
+    delete_ai_conversation_from_sqlite_shadow,
+    get_ai_conversation_by_id,
+    list_ai_conversations_for_user,
+    list_ai_messages_for_conversation,
+    sync_ai_conversation_to_sqlite_shadow,
+    sync_ai_message_to_sqlite_shadow,
+    touch_ai_conversation_doc,
+)
+from app.repositories.assignment_repository import (
+    list_assignments_by_course_ids,
+    list_submissions_for_student_assignments,
+)
+from app.repositories.course_repository import (
+    MongoCourse,
+    MongoLesson,
+    get_completed_lesson_ids,
+    get_course_by_id,
+    get_courses_by_ids,
+    get_enrollment_by_student_and_course,
+    get_lesson_by_id,
+    list_enrollments,
+    list_lessons_for_course,
+)
+from app.repositories.quiz_repository import (
+    list_quiz_attempts,
+    list_quizzes_by_course_ids,
+)
+from app.repositories.user_repository import MongoUser
 from app.schemas.ai import (
     AIChatRequest,
     AIChatResponse,
@@ -35,9 +62,9 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
-def check_course_access(db: Session, course_id: int, user: User) -> Course:
+def check_course_access(mongo_db: Database, course_id: int, user: MongoUser) -> MongoCourse:
     """Verify course exists and user is enrolled, the course instructor, or an admin."""
-    course = db.query(Course).filter(Course.id == course_id).first()
+    course = get_course_by_id(mongo_db, course_id)
     if not course:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -47,16 +74,8 @@ def check_course_access(db: Session, course_id: int, user: User) -> Course:
     if user.role == "admin" or course.instructor_id == user.id:
         return course
 
-    enrollment = (
-        db.query(CourseEnrollment)
-        .filter(
-            CourseEnrollment.course_id == course_id,
-            CourseEnrollment.student_id == user.id,
-            CourseEnrollment.status == "approved",
-        )
-        .first()
-    )
-    if not enrollment:
+    enrollment = get_enrollment_by_student_and_course(mongo_db, user.id, course_id)
+    if not enrollment or enrollment.status != "approved":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You must be enrolled in this course to access AI learning features.",
@@ -65,15 +84,15 @@ def check_course_access(db: Session, course_id: int, user: User) -> Course:
     return course
 
 
-def check_lesson_access(db: Session, lesson_id: int, user: User) -> Lesson:
+def check_lesson_access(mongo_db: Database, lesson_id: int, user: MongoUser) -> MongoLesson:
     """Verify lesson exists and user has authorization to access its parent course."""
-    lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+    lesson = get_lesson_by_id(mongo_db, lesson_id)
     if not lesson:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Lesson not found.",
         )
-    check_course_access(db, lesson.course_id, user)
+    check_course_access(mongo_db, lesson.course_id, user)
     return lesson
 
 
@@ -390,20 +409,18 @@ demo_provider = LocalDemoAIProvider()
 
 
 def handle_ai_chat(
-    db: Session,
-    user: User,
+    mongo_db: Database,
+    user: MongoUser,
     request: AIChatRequest,
+    sqlite_db: Optional[Session] = None,
 ) -> AIChatResponse:
     now = datetime.now(timezone.utc)
 
     # 1. Resolve or create conversation
     conversation = None
+    created_new_conversation = False
     if request.conversation_id:
-        conversation = (
-            db.query(AIConversation)
-            .filter(AIConversation.id == request.conversation_id)
-            .first()
-        )
+        conversation = get_ai_conversation_by_id(mongo_db, request.conversation_id)
         if not conversation:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -421,73 +438,79 @@ def handle_ai_chat(
     lesson_content = None
 
     if request.course_id:
-        course = check_course_access(db, request.course_id, user)
+        course = check_course_access(mongo_db, request.course_id, user)
         course_title = course.title
 
     if request.lesson_id:
-        lesson = check_lesson_access(db, request.lesson_id, user)
+        lesson = check_lesson_access(mongo_db, request.lesson_id, user)
         lesson_title = lesson.title
         lesson_content = lesson.content
         if not course_title:
-            course = db.query(Course).filter(Course.id == lesson.course_id).first()
+            course = get_course_by_id(mongo_db, lesson.course_id)
             course_title = course.title if course else None
 
     # 3. Create new conversation record if needed
     if not conversation:
         title = request.message[:40] + "..." if len(request.message) > 40 else request.message
-        conversation = AIConversation(
+        conversation = create_ai_conversation_doc(
+            mongo_db,
             user_id=user.id,
             course_id=request.course_id,
             title=title,
-            created_at=now,
-            updated_at=now,
+            now=now,
         )
-        db.add(conversation)
-        db.flush()
+        created_new_conversation = True
 
-    # 4. Save user message
-    user_msg = AIMessage(
-        conversation_id=conversation.id,
-        role="user",
-        content=request.message.strip(),
-        created_at=now,
-    )
-    db.add(user_msg)
-    db.flush()
-
-    # 5. Generate AI response safely
-    grounded_in = None
-    is_course_grounded = False
     try:
-        assistant_text, suggestions, grounded_in, is_course_grounded = demo_provider.generate_response(
-            query=request.message,
-            course_context=course_title,
-            lesson_title=lesson_title,
-            lesson_content=lesson_content,
+        # 4. Save user message
+        user_msg = create_ai_message_doc(
+            mongo_db,
+            conversation_id=conversation.id,
+            role="user",
+            content=request.message.strip(),
+            now=now,
         )
-        provider_name = demo_provider.PROVIDER_NAME
-        is_fallback = False
-    except Exception as exc:
-        assistant_text = (
-            "I encountered an issue processing your query at this moment. "
-            "Please rephrase your question or try again shortly."
+
+        # 5. Generate AI response safely
+        grounded_in = None
+        is_course_grounded = False
+        try:
+            assistant_text, suggestions, grounded_in, is_course_grounded = demo_provider.generate_response(
+                query=request.message,
+                course_context=course_title,
+                lesson_title=lesson_title,
+                lesson_content=lesson_content,
+            )
+            provider_name = demo_provider.PROVIDER_NAME
+            is_fallback = False
+        except Exception:
+            assistant_text = (
+                "I encountered an issue processing your query at this moment. "
+                "Please rephrase your question or try again shortly."
+            )
+            suggestions = ["Explain FastAPI architecture", "Summarize core concepts"]
+            provider_name = f"{demo_provider.PROVIDER_NAME} (Error Fallback)"
+            is_fallback = True
+
+        # 6. Save assistant message
+        finish_ts = datetime.now(timezone.utc)
+        assistant_msg = create_ai_message_doc(
+            mongo_db,
+            conversation_id=conversation.id,
+            role="assistant",
+            content=assistant_text,
+            now=finish_ts,
         )
-        suggestions = ["Explain FastAPI architecture", "Summarize core concepts"]
-        provider_name = f"{demo_provider.PROVIDER_NAME} (Error Fallback)"
-        is_fallback = True
+        conversation = touch_ai_conversation_doc(mongo_db, conversation.id, now=finish_ts) or conversation
 
-    # 6. Save assistant message
-    assistant_msg = AIMessage(
-        conversation_id=conversation.id,
-        role="assistant",
-        content=assistant_text,
-        created_at=datetime.now(timezone.utc),
-    )
-    db.add(assistant_msg)
-
-    conversation.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(conversation)
+        # Transitional SQLite shadow sync
+        sync_ai_conversation_to_sqlite_shadow(sqlite_db, conversation)
+        sync_ai_message_to_sqlite_shadow(sqlite_db, user_msg)
+        sync_ai_message_to_sqlite_shadow(sqlite_db, assistant_msg)
+    except Exception:
+        if created_new_conversation and conversation is not None:
+            delete_ai_conversation_cascade_mongo(mongo_db, conversation.id)
+        raise
 
     return AIChatResponse(
         conversation_id=conversation.id,
@@ -497,18 +520,18 @@ def handle_ai_chat(
         grounded_in=grounded_in,
         is_course_grounded=is_course_grounded,
         suggestions=suggestions,
-        created_at=datetime.now(timezone.utc),
+        created_at=finish_ts,
     )
 
 
 def summarize_lesson_service(
-    db: Session,
+    mongo_db: Database,
     lesson_id: int,
-    user: User,
+    user: MongoUser,
 ) -> LessonSummaryResponse:
     """Generate on-demand concise summary for an authorized lesson."""
-    lesson = check_lesson_access(db, lesson_id, user)
-    course = db.query(Course).filter(Course.id == lesson.course_id).first()
+    lesson = check_lesson_access(mongo_db, lesson_id, user)
+    course = get_course_by_id(mongo_db, lesson.course_id)
 
     summary_md, takeaways, word_count = demo_provider.summarize_lesson(
         lesson_title=lesson.title,
@@ -530,13 +553,13 @@ def summarize_lesson_service(
 
 
 def generate_practice_questions_service(
-    db: Session,
+    mongo_db: Database,
     lesson_id: int,
-    user: User,
+    user: MongoUser,
 ) -> PracticeQuestionsResponse:
     """Generate self-assessment practice questions strictly from lesson material."""
-    lesson = check_lesson_access(db, lesson_id, user)
-    course = db.query(Course).filter(Course.id == lesson.course_id).first()
+    lesson = check_lesson_access(mongo_db, lesson_id, user)
+    course = get_course_by_id(mongo_db, lesson.course_id)
 
     questions = demo_provider.generate_practice_questions(
         lesson_title=lesson.title,
@@ -556,7 +579,7 @@ def generate_practice_questions_service(
 
 
 def get_student_study_recommendations(
-    db: Session,
+    mongo_db: Database,
     student_id: int,
 ) -> StudyRecommendationsResponse:
     """
@@ -564,42 +587,54 @@ def get_student_study_recommendations(
     student progress, assessment scores, and assignment deadlines.
     """
     now = datetime.now(timezone.utc)
-    enrollments = (
-        db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.course))
-        .filter(
-            CourseEnrollment.student_id == student_id,
-            CourseEnrollment.status == "approved",
+    enrollments = list_enrollments(
+        mongo_db,
+        student_id=student_id,
+        status_filter="approved",
+    )
+    if not enrollments:
+        return StudyRecommendationsResponse(
+            student_id=student_id,
+            total_recommendations=0,
+            recommendations=[],
+            generated_at=now,
         )
-        .all()
+
+    course_ids = [enr.course_id for enr in enrollments]
+    courses_by_id = get_courses_by_ids(mongo_db, course_ids)
+    completed_lesson_ids = get_completed_lesson_ids(mongo_db, student_id)
+    quizzes_all = list_quizzes_by_course_ids(mongo_db, course_ids, published_only=True)
+    quiz_ids = [q.id for q in quizzes_all]
+    attempts_all = list_quiz_attempts(
+        mongo_db,
+        quiz_ids=quiz_ids,
+        student_id=student_id,
+        completed_only=True,
+    )
+    attempts_by_quiz: Dict[int, List[Any]] = {}
+    for att in attempts_all:
+        if att.quiz_id is not None:
+            attempts_by_quiz.setdefault(att.quiz_id, []).append(att)
+
+    assignments_all = list_assignments_by_course_ids(
+        mongo_db, course_ids, published_only=True
+    )
+    submissions_by_assignment = list_submissions_for_student_assignments(
+        mongo_db, student_id, [a.id for a in assignments_all]
     )
 
     recommendations: List[StudyRecommendationItem] = []
 
     for enr in enrollments:
-        course = enr.course
+        course = courses_by_id.get(enr.course_id)
         if not course:
             continue
 
         # 1. Check for uncompleted lessons in course syllabus order
-        completed_lesson_ids = set(
-            row[0]
-            for row in db.query(LessonProgress.lesson_id)
-            .filter(
-                LessonProgress.student_id == student_id,
-                LessonProgress.is_completed.is_(True),
-            )
-            .all()
+        all_lessons = list_lessons_for_course(mongo_db, course.id)
+        first_uncompleted = next(
+            (l for l in all_lessons if l.id not in completed_lesson_ids), None
         )
-
-        all_lessons = (
-            db.query(Lesson)
-            .filter(Lesson.course_id == course.id)
-            .order_by(Lesson.order_index.asc())
-            .all()
-        )
-
-        first_uncompleted = next((l for l in all_lessons if l.id not in completed_lesson_ids), None)
         if first_uncompleted:
             recommendations.append(
                 StudyRecommendationItem(
@@ -614,27 +649,24 @@ def get_student_study_recommendations(
                     action_url=f"/courses/{course.id}/learn/{first_uncompleted.id}",
                     course_id=course.id,
                     course_title=course.title,
-                    context_meta={"lesson_id": first_uncompleted.id, "order_index": first_uncompleted.order_index},
+                    context_meta={
+                        "lesson_id": first_uncompleted.id,
+                        "order_index": first_uncompleted.order_index,
+                    },
                 )
             )
 
         # 2. Check for failed or low-scoring quiz attempts
-        quizzes = db.query(Quiz).filter(Quiz.course_id == course.id, Quiz.is_published.is_(True)).all()
-        for q in quizzes:
-            attempts = (
-                db.query(QuizAttempt)
-                .filter(
-                    QuizAttempt.quiz_id == q.id,
-                    QuizAttempt.student_id == student_id,
-                    QuizAttempt.is_completed.is_(True),
-                )
-                .order_by(QuizAttempt.score.desc())
-                .all()
+        course_quizzes = [q for q in quizzes_all if q.course_id == course.id]
+        for q in course_quizzes:
+            attempts = sorted(
+                attempts_by_quiz.get(q.id, []),
+                key=lambda a: a.score,
+                reverse=True,
             )
-
             if attempts:
                 best_attempt = attempts[0]
-                pct = (best_attempt.score / best_attempt.max_score * 100) if best_attempt.max_score > 0 else 0
+                pct = float(best_attempt.score)
                 if pct < q.passing_score:
                     recommendations.append(
                         StudyRecommendationItem(
@@ -643,18 +675,21 @@ def get_student_study_recommendations(
                             priority="high",
                             title=f"Review & Retake Quiz: {q.title}",
                             description=(
-                                f"Your best score was {best_attempt.score}/{best_attempt.max_score} ({round(pct)}%), "
+                                f"Your best score was {round(pct)}%, "
                                 f"which is below the {q.passing_score}% passing benchmark. "
                                 f"Review the related course lessons and try the quiz again."
                             ),
                             action_url=f"/courses/{course.id}/quizzes/{q.id}",
                             course_id=course.id,
                             course_title=course.title,
-                            context_meta={"quiz_id": q.id, "score": best_attempt.score, "passing_score": q.passing_score},
+                            context_meta={
+                                "quiz_id": q.id,
+                                "score": best_attempt.score,
+                                "passing_score": q.passing_score,
+                            },
                         )
                     )
             elif len(completed_lesson_ids) > 0 and not first_uncompleted:
-                # All lessons done but quiz not yet taken
                 recommendations.append(
                     StudyRecommendationItem(
                         id=f"quiz-take-{q.id}",
@@ -670,16 +705,9 @@ def get_student_study_recommendations(
                 )
 
         # 3. Check for upcoming assignment deadlines
-        assignments = db.query(Assignment).filter(Assignment.course_id == course.id, Assignment.is_published.is_(True)).all()
-        for a in assignments:
-            sub = (
-                db.query(AssignmentSubmission)
-                .filter(
-                    AssignmentSubmission.assignment_id == a.id,
-                    AssignmentSubmission.student_id == student_id,
-                )
-                .first()
-            )
+        course_assignments = [a for a in assignments_all if a.course_id == course.id]
+        for a in course_assignments:
+            sub = submissions_by_assignment.get(a.id)
             if not sub:
                 due_utc = _ensure_utc(a.due_date)
                 is_past_due = due_utc and due_utc < now
@@ -700,11 +728,13 @@ def get_student_study_recommendations(
                         action_url=f"/courses/{course.id}/assignments/{a.id}",
                         course_id=course.id,
                         course_title=course.title,
-                        context_meta={"assignment_id": a.id, "due_date": a.due_date.isoformat() if a.due_date else None},
+                        context_meta={
+                            "assignment_id": a.id,
+                            "due_date": a.due_date.isoformat() if a.due_date else None,
+                        },
                     )
                 )
 
-    # Sort recommendations by priority (urgent -> high -> medium -> low)
     priority_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
     recommendations.sort(key=lambda r: priority_order.get(r.priority, 99))
 
@@ -716,34 +746,26 @@ def get_student_study_recommendations(
     )
 
 
-def list_user_conversations(db: Session, user_id: int) -> List[Dict[str, Any]]:
-    convs = (
-        db.query(AIConversation)
-        .options(joinedload(AIConversation.messages))
-        .filter(AIConversation.user_id == user_id)
-        .order_by(AIConversation.updated_at.desc())
-        .all()
-    )
-    result = []
-    for c in convs:
-        result.append({
+def list_user_conversations(mongo_db: Database, user_id: int) -> List[Dict[str, Any]]:
+    convs = list_ai_conversations_for_user(mongo_db, user_id)
+    counts = count_ai_messages_by_conversation_ids(mongo_db, [c.id for c in convs])
+    return [
+        {
             "id": c.id,
             "title": c.title,
             "course_id": c.course_id,
-            "message_count": len(c.messages),
+            "message_count": counts.get(c.id, 0),
             "created_at": c.created_at,
             "updated_at": c.updated_at,
-        })
-    return result
+        }
+        for c in convs
+    ]
 
 
-def get_conversation_detail(db: Session, conversation_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    conv = (
-        db.query(AIConversation)
-        .options(joinedload(AIConversation.messages))
-        .filter(AIConversation.id == conversation_id)
-        .first()
-    )
+def get_conversation_detail(
+    mongo_db: Database, conversation_id: int, user_id: int
+) -> Optional[Dict[str, Any]]:
+    conv = get_ai_conversation_by_id(mongo_db, conversation_id)
     if not conv:
         return None
     if conv.user_id != user_id:
@@ -752,7 +774,7 @@ def get_conversation_detail(db: Session, conversation_id: int, user_id: int) -> 
             detail="You do not have access to this conversation.",
         )
 
-    sorted_messages = sorted(conv.messages, key=lambda m: m.created_at)
+    msgs = list_ai_messages_for_conversation(mongo_db, conv.id)
     messages = [
         {
             "id": m.id,
@@ -760,7 +782,7 @@ def get_conversation_detail(db: Session, conversation_id: int, user_id: int) -> 
             "content": m.content,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
-        for m in sorted_messages
+        for m in msgs
     ]
     return {
         "id": conv.id,
@@ -770,3 +792,24 @@ def get_conversation_detail(db: Session, conversation_id: int, user_id: int) -> 
         "created_at": conv.created_at,
         "updated_at": conv.updated_at,
     }
+
+
+def delete_user_conversation(
+    mongo_db: Database,
+    conversation_id: int,
+    user_id: int,
+    sqlite_db: Optional[Session] = None,
+) -> None:
+    conv = get_ai_conversation_by_id(mongo_db, conversation_id)
+    if not conv:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found.",
+        )
+    if conv.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to delete this conversation.",
+        )
+    delete_ai_conversation_cascade_mongo(mongo_db, conversation_id)
+    delete_ai_conversation_from_sqlite_shadow(sqlite_db, conversation_id)

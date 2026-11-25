@@ -1,11 +1,11 @@
 from typing import List
 
 from fastapi import APIRouter, Depends, Response, status
+from pymongo.database import Database
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_db, require_student
-from app.models.ai_learning import AIQuiz, AIQuizAttempt
-from app.models.user import User
+from app.dependencies import get_db, get_mongo_db, require_student
+from app.repositories.user_repository import MongoUser
 from app.schemas.ai_learning import (
     AICourseOutline,
     AIQuizAttemptResponse,
@@ -25,6 +25,8 @@ from app.schemas.ai_learning import (
     StudyTaskStatusUpdate,
 )
 from app.services.ai_quiz_service import (
+    EnrichedAIQuiz,
+    EnrichedAIQuizAttempt,
     generate_quiz,
     get_quiz_attempt_review,
     get_quiz_history,
@@ -48,7 +50,7 @@ from app.services.study_planner_service import (
 router = APIRouter(prefix="/student/ai-learning", tags=["Student AI Learning Tools"])
 
 
-def _quiz_response(quiz: AIQuiz) -> dict:
+def _quiz_response(quiz: EnrichedAIQuiz) -> dict:
     return {
         "quiz": {
             "id": quiz.id,
@@ -79,7 +81,7 @@ def _quiz_response(quiz: AIQuiz) -> dict:
     }
 
 
-def _attempt_response(attempt: AIQuizAttempt) -> dict:
+def _attempt_response(attempt: EnrichedAIQuizAttempt) -> dict:
     return {
         "id": attempt.id,
         "quiz_id": attempt.quiz_id,
@@ -101,7 +103,9 @@ def _attempt_response(attempt: AIQuizAttempt) -> dict:
                 "submitted_answer": (
                     answer.answer_text
                     if answer.question.question_type == "short_answer"
-                    else answer.selected_option.option_text if answer.selected_option else None
+                    else answer.selected_option.option_text
+                    if answer.selected_option
+                    else None
                 ),
                 "correct_answer": answer.question.correct_answer,
                 "is_correct": answer.is_correct,
@@ -118,28 +122,32 @@ def _attempt_response(attempt: AIQuizAttempt) -> dict:
 
 @router.get("/courses", response_model=List[AICourseOutline])
 def list_ai_learning_courses(
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_student_course_outline(db, current_user.id)
+    return get_student_course_outline(mongo_db, current_user.id)
 
 
 @router.post("/quizzes", response_model=AIQuizGeneratedResponse, status_code=status.HTTP_201_CREATED)
 def create_ai_quiz(
     request: AIQuizGenerationRequest,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return _quiz_response(generate_quiz(db, current_user.id, request))
+    return _quiz_response(
+        generate_quiz(mongo_db, current_user.id, request, sqlite_db=db)
+    )
 
 
 @router.post("/quizzes/{quiz_id}/attempts", response_model=AIQuizStartResponse, status_code=status.HTTP_201_CREATED)
 def begin_ai_quiz_attempt(
     quiz_id: int,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    attempt = start_quiz_attempt(db, current_user.id, quiz_id)
+    attempt = start_quiz_attempt(mongo_db, current_user.id, quiz_id, sqlite_db=db)
     return {"attempt_id": attempt.id, "started_at": attempt.started_at}
 
 
@@ -147,38 +155,44 @@ def begin_ai_quiz_attempt(
 def submit_ai_quiz_attempt(
     attempt_id: int,
     request: AIQuizSubmitRequest,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    attempt = submit_quiz_attempt(db, current_user.id, attempt_id, request)
+    attempt = submit_quiz_attempt(
+        mongo_db, current_user.id, attempt_id, request, sqlite_db=db
+    )
     return _attempt_response(attempt)
 
 
 @router.get("/attempts/{attempt_id}", response_model=AIQuizAttemptResponse)
 def review_ai_quiz_attempt(
     attempt_id: int,
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    attempt = get_quiz_attempt_review(db, current_user.id, attempt_id)
+    attempt = get_quiz_attempt_review(mongo_db, current_user.id, attempt_id)
     return _attempt_response(attempt)
 
 
 @router.get("/quizzes/history", response_model=List[AIQuizHistoryItem])
 def list_ai_quiz_history(
-    current_user: User = Depends(require_student),
-    db: Session = Depends(get_db),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
 ):
-    return get_quiz_history(db, current_user.id)
+    return get_quiz_history(mongo_db, current_user.id)
 
 
 @router.post("/attempts/{attempt_id}/request-review", response_model=AIQuizReviewRequestResponse)
 def ask_for_instructor_review(
     attempt_id: int,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    requested_at = request_instructor_review(db, current_user.id, attempt_id)
+    requested_at = request_instructor_review(
+        mongo_db, current_user.id, attempt_id, sqlite_db=db
+    )
     return {
         "message": "Your instructor has been notified and can review the automated short-answer grading.",
         "review_requested_at": requested_at,
@@ -187,39 +201,43 @@ def ask_for_instructor_review(
 
 @router.get("/planner", response_model=StudyPlanDashboardResponse)
 def get_study_planner_dashboard(
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return get_planner_dashboard(db, current_user.id)
+    return get_planner_dashboard(mongo_db, current_user.id, sqlite_db=db)
 
 
 @router.put("/planner/preferences", response_model=StudyPreferenceResponse)
 def update_study_preferences(
     request: StudyPlanGenerationRequest,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    return save_study_preferences(db, current_user.id, request)
+    return save_study_preferences(mongo_db, current_user.id, request, sqlite_db=db)
 
 
 @router.post("/planner/generate", response_model=StudyPlanGenerationResponse, status_code=status.HTTP_201_CREATED)
 def create_study_plan(
     request: StudyPlanGenerationRequest,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    generate_study_plan(db, current_user.id, request)
-    return get_planner_dashboard(db, current_user.id)
+    generate_study_plan(mongo_db, current_user.id, request, sqlite_db=db)
+    return get_planner_dashboard(mongo_db, current_user.id, sqlite_db=db)
 
 
 @router.patch("/planner/tasks/{task_id}", response_model=StudyTaskResponse)
 def complete_study_task(
     task_id: int,
     request: StudyTaskStatusUpdate,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    task = update_study_task_status(db, current_user.id, task_id)
+    task = update_study_task_status(mongo_db, current_user.id, task_id, sqlite_db=db)
     return serialize_study_task(task)
 
 
@@ -227,30 +245,37 @@ def complete_study_task(
 def move_study_task(
     task_id: int,
     request: StudyTaskRescheduleRequest,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    task = reschedule_study_task(db, current_user.id, task_id, request.scheduled_at)
+    task = reschedule_study_task(
+        mongo_db, current_user.id, task_id, request.scheduled_at, sqlite_db=db
+    )
     return serialize_study_task(task)
 
 
 @router.delete("/planner/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_study_task(
     task_id: int,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    delete_study_task(db, current_user.id, task_id)
+    delete_study_task(mongo_db, current_user.id, task_id, sqlite_db=db)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/planner/reminders/{reminder_id}/read", response_model=StudyReminderResponse)
 def read_study_reminder(
     reminder_id: int,
-    current_user: User = Depends(require_student),
+    current_user: MongoUser = Depends(require_student),
+    mongo_db: Database = Depends(get_mongo_db),
     db: Session = Depends(get_db),
 ):
-    reminder = mark_study_reminder_read(db, current_user.id, reminder_id)
+    reminder = mark_study_reminder_read(
+        mongo_db, current_user.id, reminder_id, sqlite_db=db
+    )
     return {
         "id": reminder.id,
         "notification_type": reminder.notification_type,

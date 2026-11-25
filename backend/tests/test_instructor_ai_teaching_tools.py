@@ -2,12 +2,28 @@ import json
 from uuid import uuid4
 
 from app.database import SessionLocal
-from app.models.assignment import Assignment, AssignmentSubmission
-from app.models.course import Course
-from app.models.enrollment import CourseEnrollment
-from app.models.lesson import Lesson
-from app.models.section import CourseSection
-from app.models.user import User
+from app.mongodb import get_mongo_database
+from app.repositories.assignment_repository import (
+    create_assignment_doc,
+    create_submission_doc,
+    sync_assignment_to_sqlite_shadow,
+    sync_submission_to_sqlite_shadow,
+)
+from app.repositories.course_repository import (
+    create_course_doc,
+    create_enrollment_doc,
+    create_lesson_doc,
+    create_section_doc,
+    sync_course_to_sqlite_shadow,
+    sync_enrollment_to_sqlite_shadow,
+    sync_lesson_to_sqlite_shadow,
+    sync_section_to_sqlite_shadow,
+)
+from app.repositories.user_repository import (
+    create_user,
+    get_user_by_email,
+    sync_user_to_sqlite_shadow,
+)
 from app.security.password import hash_password
 from app.services.storage import get_storage_provider
 
@@ -29,19 +45,23 @@ def _create_test_context(client):
     )
     assert registered.status_code == 201
 
+    mongo_db = get_mongo_database()
     db = SessionLocal()
     try:
-        instructor = db.query(User).filter(User.email == instructor_email).one()
-        student = db.query(User).filter(User.email == student_email).one()
-        other_instructor = User(
+        instructor = get_user_by_email(mongo_db, instructor_email)
+        student = get_user_by_email(mongo_db, student_email)
+        assert instructor is not None and student is not None
+        other_instructor = create_user(
+            mongo_db,
             full_name="Other Faculty",
             email=other_instructor_email,
             password_hash=hash_password(password),
             role="instructor",
         )
-        db.add(other_instructor)
+        sync_user_to_sqlite_shadow(db, other_instructor)
         suffix = uuid4().hex[:10]
-        course = Course(
+        course = create_course_doc(
+            mongo_db,
             title=f"Instructor AI Course {suffix}",
             description="Course created for instructor AI tool tests.",
             category="Testing",
@@ -49,38 +69,54 @@ def _create_test_context(client):
             instructor_id=instructor.id,
             is_published=True,
         )
-        db.add(course)
-        db.flush()
-        section = CourseSection(course_id=course.id, title="Foundations", order_index=1)
-        db.add(section)
-        db.flush()
-        lesson = Lesson(
+        sync_course_to_sqlite_shadow(db, course)
+        section = create_section_doc(
+            mongo_db,
+            course_id=course.id,
+            title="Foundations",
+            description=None,
+            order_index=1,
+        )
+        sync_section_to_sqlite_shadow(db, section)
+        lesson = create_lesson_doc(
+            mongo_db,
             course_id=course.id,
             section_id=section.id,
             title="Service boundaries",
             order_index=1,
+            video_url=None,
             content="A service boundary separates responsibilities. Services own domain behavior and coordinate persistence.",
         )
-        assignment = Assignment(
+        sync_lesson_to_sqlite_shadow(db, lesson)
+        assignment = create_assignment_doc(
+            mongo_db,
             course_id=course.id,
             section_id=section.id,
             title="Explain service boundaries",
             description="Explain an architectural concept.",
             instructions="Explain what a service boundary is and why responsibilities should be separated.",
             max_marks=10,
+            due_date=None,
             is_published=True,
+            allow_resubmission=True,
         )
-        db.add_all([lesson, assignment])
-        db.add(CourseEnrollment(student_id=student.id, course_id=course.id, status="approved"))
-        db.flush()
-        submission = AssignmentSubmission(
+        sync_assignment_to_sqlite_shadow(db, assignment)
+        enrollment = create_enrollment_doc(
+            mongo_db,
+            student_id=student.id,
+            course_id=course.id,
+            enrollment_status="approved",
+        )
+        sync_enrollment_to_sqlite_shadow(db, enrollment)
+        submission = create_submission_doc(
+            mongo_db,
             assignment_id=assignment.id,
             student_id=student.id,
             submission_text="A service boundary separates domain responsibilities and helps coordinate persistence.",
-            status="submitted",
+            attachments_json=None,
+            is_late=False,
         )
-        db.add(submission)
-        db.commit()
+        sync_submission_to_sqlite_shadow(db, submission)
         return {
             "course_id": course.id,
             "section_id": section.id,
