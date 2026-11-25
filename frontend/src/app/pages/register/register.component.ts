@@ -68,7 +68,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
           </div>
         }
 
-        <form [formGroup]="registerForm" (ngSubmit)="onSubmit()" class="auth-form">
+        <form [formGroup]="registerForm" (ngSubmit)="onSubmit()" class="auth-form" autocomplete="off">
           <div class="form-group">
             <label class="form-label" for="full_name">
               {{ selectedRole === 'instructor' ? 'Instructor Full Name' : 'Full Name' }}
@@ -78,6 +78,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
               type="text"
               class="form-input"
               formControlName="full_name"
+              autocomplete="off"
               [placeholder]="selectedRole === 'instructor' ? 'e.g. Dr. Sarah Chen' : 'e.g. Jordan Taylor'"
               [class.input-error]="isFieldInvalid('full_name')"
             />
@@ -93,6 +94,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
               type="email"
               class="form-input"
               formControlName="email"
+              autocomplete="off"
               [placeholder]="selectedRole === 'instructor' ? 'e.g. instructor@eduverse.io' : 'e.g. student@eduverse.io'"
               [class.input-error]="isFieldInvalid('email')"
             />
@@ -108,6 +110,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
               type="password"
               class="form-input"
               formControlName="password"
+              autocomplete="new-password"
               placeholder="At least 8 characters, including a letter and number"
               [class.input-error]="isFieldInvalid('password')"
             />
@@ -125,6 +128,7 @@ function passwordMatchValidator(control: AbstractControl): ValidationErrors | nu
               type="password"
               class="form-input"
               formControlName="confirm_password"
+              autocomplete="new-password"
               placeholder="Re-enter password"
               [class.input-error]="registerForm.hasError('passwordMismatch') && registerForm.get('confirm_password')?.touched"
             />

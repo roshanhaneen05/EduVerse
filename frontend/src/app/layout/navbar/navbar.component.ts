@@ -33,15 +33,17 @@ import { UserNotification } from '../../core/models/notification.model';
                 </svg>
                 Courses
               </a>
-              <a routerLink="/student/my-learning" routerLinkActive="active" class="nav-link">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3" y="3" width="7" height="9"/>
-                  <rect x="14" y="3" width="7" height="5"/>
-                  <rect x="14" y="12" width="7" height="9"/>
-                  <rect x="3" y="16" width="7" height="5"/>
-                </svg>
-                My Learning
-              </a>
+              @if (!auth.isAdmin()) {
+                <a routerLink="/student/my-learning" routerLinkActive="active" class="nav-link">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="7" height="9"/>
+                    <rect x="14" y="3" width="7" height="5"/>
+                    <rect x="14" y="12" width="7" height="9"/>
+                    <rect x="3" y="16" width="7" height="5"/>
+                  </svg>
+                  My Learning
+                </a>
+              }
               @if (auth.isInstructor()) {
                 <a routerLink="/instructor/dashboard" routerLinkActive="active" class="nav-link">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -517,14 +519,14 @@ export class NavbarComponent implements OnInit {
     // When authentication status changes, load unread count
     effect(() => {
       if (this.auth.isAuthenticated()) {
-        this.notificationService.fetchUnreadCount().subscribe({ error: () => {} });
+        this.notificationService.fetchUnreadCount().subscribe({ error: () => { } });
       }
     });
   }
 
   ngOnInit(): void {
     if (this.auth.isAuthenticated()) {
-      this.notificationService.fetchUnreadCount().subscribe({ error: () => {} });
+      this.notificationService.fetchUnreadCount().subscribe({ error: () => { } });
     }
   }
 

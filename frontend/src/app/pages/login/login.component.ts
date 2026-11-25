@@ -171,7 +171,7 @@ import { AuthService } from '../../core/services/auth.service';
             }
 
             <!-- Form -->
-            <form [formGroup]="loginForm" (ngSubmit)="onSubmit()" class="login-inputs-form">
+            <form [formGroup]="loginForm" (ngSubmit)="onSubmit()" class="login-inputs-form" autocomplete="off">
               <!-- Email Address -->
               <div class="field-wrapper">
                 <div class="field-title-row">
@@ -188,7 +188,7 @@ import { AuthService } from '../../core/services/auth.service';
                   formControlName="email"
                   placeholder="Enter your email address"
                   [class.has-error]="isFieldInvalid('email')"
-                  autocomplete="email"
+                  autocomplete="off"
                 />
                 @if (isFieldInvalid('email')) {
                   <div class="validation-error">Please enter a valid email address.</div>
@@ -215,7 +215,7 @@ import { AuthService } from '../../core/services/auth.service';
                     formControlName="password"
                     placeholder="Enter your password"
                     [class.has-error]="isFieldInvalid('password')"
-                    autocomplete="current-password"
+                    autocomplete="new-password"
                   />
                   <button
                     type="button"

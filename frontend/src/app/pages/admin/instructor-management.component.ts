@@ -58,8 +58,17 @@ import { AdminService } from '../../core/services/admin.service';
                 </label>
                 <label class="field">
                   <span>Phone Number *</span>
-                  <input class="form-input" type="tel" formControlName="phone_number" autocomplete="tel" />
-                  @if (fieldInvalid('phone_number')) { <small>Enter a phone number of at least 7 characters.</small> }
+                  <input
+                    class="form-input"
+                    type="tel"
+                    inputmode="numeric"
+                    maxlength="30"
+                    pattern="[0-9]*"
+                    formControlName="phone_number"
+                    autocomplete="tel"
+                    (input)="sanitizePhoneNumber($event)"
+                  />
+                  @if (fieldInvalid('phone_number')) { <small>Enter a phone number containing 7 to 30 digits.</small> }
                 </label>
                 <label class="field">
                   <span>Qualification *</span>
@@ -303,7 +312,7 @@ export class InstructorManagementComponent implements OnInit {
     this.instructorForm = this.fb.group({
       full_name: ['', [Validators.required, Validators.minLength(2), Validators.maxLength(100)]],
       email: ['', [Validators.required, Validators.email, Validators.maxLength(255)]],
-      phone_number: ['', [Validators.required, Validators.minLength(7), Validators.maxLength(30)]],
+      phone_number: ['', [Validators.required, Validators.minLength(7), Validators.maxLength(30), Validators.pattern(/^\d+$/)]],
       qualification: ['', [Validators.required, Validators.minLength(2), Validators.maxLength(150)]],
       department: ['', [Validators.required, Validators.minLength(2), Validators.maxLength(150)]],
       subject_expertise: ['', [Validators.required, Validators.minLength(2), Validators.maxLength(255)]],
@@ -387,6 +396,16 @@ export class InstructorManagementComponent implements OnInit {
   fieldInvalid(fieldName: string): boolean {
     const control = this.instructorForm.get(fieldName);
     return !!control && control.invalid && (control.dirty || control.touched);
+  }
+
+  sanitizePhoneNumber(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const digitsOnly = input.value.replace(/[^0-9]/g, '');
+
+    if (input.value !== digitsOnly) {
+      input.value = digitsOnly;
+      this.instructorForm.controls['phone_number'].setValue(digitsOnly);
+    }
   }
 
   saveInstructor(): void {
